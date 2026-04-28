@@ -12,6 +12,7 @@ Architecture:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -171,6 +172,46 @@ def _populate_channel_secrets() -> None:
             log.info("Skipped %s (%s)", secret_id, type(exc).__name__)
 
 
+# Per-request context — set by ``invoke()`` before each agent run, read by
+# tool-call guards.  Thread-local so concurrent generators don't leak scope.
+_request_context = threading.local()
+
+
+def _install_discord_channel_guard() -> None:
+    """Restrict tools/discord_tool so ``fetch_messages`` / ``create_thread``
+    can only target the channel that originated the request.
+
+    The guard reads ``_request_context.channel_id`` (set per-request in
+    ``invoke``) and rejects calls whose ``channel_id`` argument doesn't match.
+    Layer 2 of the channel-scope defence: even with prompt-injection, the
+    model can't read messages from a different channel — the tool returns
+    an error string to the LLM and the LLM relays it to the user."""
+    from tools import discord_tool as _dt
+
+    original = _dt._run_discord_action
+
+    def guarded(action, valid_actions, tool_label, **kwargs):
+        allowed = getattr(_request_context, "channel_id", None)
+        target = (kwargs.get("channel_id") or "").strip()
+        if allowed and target and target != allowed:
+            log.warning(
+                "Discord channel-scope violation: action=%s target=%s allowed=%s",
+                action, target, allowed,
+            )
+            return json.dumps({
+                "error": "channel_out_of_scope",
+                "message": (
+                    f"This conversation is scoped to Discord channel "
+                    f"{allowed}. Reading or writing channel {target} is "
+                    f"not allowed. Tell the user you can only operate on "
+                    f"the current channel."
+                ),
+            })
+        return original(action, valid_actions, tool_label, **kwargs)
+
+    _dt._run_discord_action = guarded
+
+
 def get_or_create_agent(channel: str = "agentcore"):
     """Lazy-init the full hermes-agent. Blocks on first call (~5-15s)."""
     global _agent
@@ -220,8 +261,21 @@ def get_or_create_agent(channel: str = "agentcore"):
         model=model,
         provider="anthropic",
         platform=channel,
+        # Layer 1 of channel-scope defence: never expose discord_admin
+        # (server-wide listing/management actions). Layer 2 lives in
+        # _install_discord_channel_guard.
+        disabled_toolsets=["discord_admin"],
         quiet_mode=True,
     )
+
+    # Install the discord channel-scope guard after AIAgent has imported the
+    # tools registry (the guard wraps tools/discord_tool._run_discord_action).
+    if os.environ.get("DISCORD_BOT_TOKEN"):
+        try:
+            _install_discord_channel_guard()
+            log.info("Discord channel-scope guard installed")
+        except Exception as exc:
+            log.warning("Could not install discord channel-scope guard: %s", exc)
 
     log.info(
         "hermes-agent ready (model=%s, region=%s, platform=%s, backend=bedrock)",
@@ -267,9 +321,25 @@ async def invoke(payload, context):
     try:
         agent = get_or_create_agent(channel=channel)
 
+        chat_id = payload.get("chatId") or ""
+        # Tell the channel-scope guard which channel this request is from.
+        # Layer 2 of the defence: tool calls reaching a different channel_id
+        # are rejected with channel_out_of_scope before hitting Discord.
+        _request_context.channel_id = chat_id if channel == "discord" else None
+
         system_extra = f"The user is contacting you via {channel}."
-        if payload.get("chatId"):
-            system_extra += f" Chat ID: {payload['chatId']}."
+        if chat_id:
+            system_extra += f" Chat ID: {chat_id}."
+        if channel == "discord" and chat_id:
+            # Layer 3: instruct the model to refuse cross-channel reads.
+            # The guard enforces it regardless, but this surfaces a friendly
+            # refusal message instead of relying on the tool error.
+            system_extra += (
+                f" This conversation is scoped to Discord channel {chat_id}. "
+                "Discord tools may only read or write this channel — if asked "
+                "to access a different channel, decline and explain that "
+                "the bot is restricted to the current channel."
+            )
 
         # Restore conversation history from the gateway payload so the
         # agent has context from previous turns.
