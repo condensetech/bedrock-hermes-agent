@@ -146,8 +146,32 @@ def _ensure_workspace(session_id: str | None) -> None:
 
 _agent = None
 
+# Channel tokens fetched from Secrets Manager into env vars.  hermes-agent's
+# built-in tools (e.g. tools/discord_tool.py) gate on these env vars via
+# their check_fn, so populating them before AIAgent() makes the tool schema
+# self-register.
+_CHANNEL_SECRET_ENV = {
+    "hermes/discord-bot-token": "DISCORD_BOT_TOKEN",
+}
 
-def get_or_create_agent():
+
+def _populate_channel_secrets() -> None:
+    """Fetch channel API tokens from Secrets Manager and expose them as env
+    vars so hermes-agent's built-in channel tools opt in automatically."""
+    import boto3
+    sm = boto3.client("secretsmanager", region_name=_get_region())
+    for secret_id, env_var in _CHANNEL_SECRET_ENV.items():
+        if os.environ.get(env_var):
+            continue
+        try:
+            value = sm.get_secret_value(SecretId=secret_id)["SecretString"]
+            os.environ[env_var] = value
+            log.info("Loaded %s into %s", secret_id, env_var)
+        except Exception as exc:
+            log.info("Skipped %s (%s)", secret_id, type(exc).__name__)
+
+
+def get_or_create_agent(channel: str = "agentcore"):
     """Lazy-init the full hermes-agent. Blocks on first call (~5-15s)."""
     global _agent
     if _agent is not None:
@@ -161,6 +185,8 @@ def get_or_create_agent():
     region = _get_region()
     os.environ.setdefault("AWS_DEFAULT_REGION", region)
     os.environ.setdefault("AWS_REGION", region)
+
+    _populate_channel_secrets()
 
     import run_agent
 
@@ -193,10 +219,14 @@ def get_or_create_agent():
     _agent = _BedrockAIAgent(
         model=model,
         provider="anthropic",
+        platform=channel,
         quiet_mode=True,
     )
 
-    log.info("hermes-agent ready (model=%s, region=%s, backend=bedrock)", model, region)
+    log.info(
+        "hermes-agent ready (model=%s, region=%s, platform=%s, backend=bedrock)",
+        model, region, channel,
+    )
     return _agent
 
 
@@ -235,7 +265,7 @@ async def invoke(payload, context):
     _ensure_workspace(_resolve_session_id(payload, context))
 
     try:
-        agent = get_or_create_agent()
+        agent = get_or_create_agent(channel=channel)
 
         system_extra = f"The user is contacting you via {channel}."
         if payload.get("chatId"):
