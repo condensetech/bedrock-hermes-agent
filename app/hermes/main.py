@@ -162,25 +162,39 @@ def get_or_create_agent():
     os.environ.setdefault("AWS_DEFAULT_REGION", region)
     os.environ.setdefault("AWS_REGION", region)
 
-    from run_agent import AIAgent
+    import run_agent
 
-    # Patch the class method BEFORE creating the agent instance.
-    # This ensures preserve_dots=True during __init__ normalization.
-    AIAgent._anthropic_preserve_dots = lambda self: True
+    # Patch _anthropic_preserve_dots so message-send paths don't re-normalize
+    # the model ID into the dashed form Bedrock rejects.
+    run_agent.AIAgent._anthropic_preserve_dots = lambda self: True
+
+    # Subclass AIAgent so the dotted Bedrock model ID survives __init__ for
+    # every instance — parent and any subagent created by delegate_task.
+    # hermes-agent's __init__ runs normalize_model_for_provider() which
+    # hard-codes provider="anthropic" → dot-to-dash and is *not* gated by
+    # _anthropic_preserve_dots.  Restoring `self.model` after super().__init__
+    # is enough; delegate_tool.py imports AIAgent fresh on each child build,
+    # so rebinding run_agent.AIAgent here makes the subclass picked up.
+    _OriginalAIAgent = run_agent.AIAgent
+
+    class _BedrockAIAgent(_OriginalAIAgent):
+        def __init__(self, *args, **kwargs):
+            requested_model = kwargs.get("model")
+            super().__init__(*args, **kwargs)
+            if requested_model:
+                self.model = requested_model
+
+    run_agent.AIAgent = _BedrockAIAgent
 
     # Use Bedrock model ID directly. The monkey-patched anthropic SDK
     # routes everything through Bedrock automatically.
     model = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-6")
 
-    _agent = AIAgent(
+    _agent = _BedrockAIAgent(
         model=model,
         provider="anthropic",
         quiet_mode=True,
     )
-    # Force-restore the dotted Bedrock model ID — hermes-agent's __init__
-    # normalises dots to dashes (us.anthropic... → us-anthropic...) which
-    # Bedrock rejects as an invalid model identifier.
-    _agent.model = model
 
     log.info("hermes-agent ready (model=%s, region=%s, backend=bedrock)", model, region)
     return _agent
