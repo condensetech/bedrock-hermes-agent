@@ -22,7 +22,8 @@ COPY hermes-agent/ /build/hermes-agent/
 # Install hermes-agent + bridge deps into a prefix we can copy later.
 RUN pip install --no-cache-dir --prefix=/install \
         -e "/build/hermes-agent[cron,mcp]" \
-        boto3 botocore litellm bedrock-agentcore
+        boto3 botocore litellm bedrock-agentcore \
+        "sentry-sdk>=2,<3"
 
 # Pre-compile .pyc files for faster cold start.
 RUN python -m compileall -q /install/lib 2>/dev/null || true

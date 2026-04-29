@@ -55,6 +55,9 @@ class HermesTokenMonitoringStack(Stack):
                 "DAILY_TOKEN_BUDGET": daily_token_budget,
                 "DAILY_COST_BUDGET_USD": daily_cost_budget,
                 "ALARM_SNS_TOPIC_ARN": alarm_topic_arn,
+                # Stamped at deploy time by scripts/deploy.sh — surfaces in
+                # Sentry events as the `release` field.
+                "RELEASE_SHA": self.node.try_get_context("release_sha") or "",
             },
             log_retention=logs.RetentionDays.ONE_MONTH,
         )

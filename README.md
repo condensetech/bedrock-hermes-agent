@@ -324,6 +324,39 @@ Key settings in `cdk.json`:
 | `daily_token_budget` | `2000000` | Daily token limit |
 | `daily_cost_budget_usd` | `20` | Daily cost cap (USD) |
 
+## Observability (Sentry)
+
+Optional Sentry integration for the Lambda routers and the AgentCore runtime container. Per-component DSN model — each component points at its own Sentry project so alerts/quotas don't co-mingle.
+
+**What's instrumented**:
+
+| Component | Sentry secret | Project (recommended) |
+|---|---|---|
+| Router Lambda (`lambda/router`) | `hermes/sentry-dsn-router` | `hermes-router` |
+| Cron Lambda (`lambda/cron`) | `hermes/sentry-dsn-cron` | `hermes-cron` |
+| Token-metrics Lambda (`lambda/token_metrics`) | `hermes/sentry-dsn-token-metrics` | `hermes-token-metrics` |
+| AgentCore container (`app/hermes/main.py`) | `hermes/sentry-dsn-runtime` | `hermes-runtime` |
+
+**Closed by default** — missing secret means Sentry is disabled for that component; nothing breaks. To enable a component:
+
+1. Create a Sentry project in your org and copy its DSN.
+2. Store as the per-component secret:
+
+   ```bash
+   aws secretsmanager create-secret \
+     --name hermes/sentry-dsn-router \
+     --secret-string 'https://<key>@oXXXX.ingest.sentry.io/<project_id>' \
+     --region eu-central-1
+   ```
+
+3. Redeploy the affected component: `phase3` for lambdas, `phase2` for the container.
+
+The router lambda tags every event with `channel` and `actor_id`, so Sentry's UI lets you filter "only github failures" or "only this user's requests".
+
+**Auto-LoggingIntegration**: existing `logger.exception(...)` and `logger.error(...)` calls in the codebase become Sentry events automatically. No explicit `capture_exception` calls needed — instrumentation is just `sentry_sdk.init(...)` at module load. The SDK is `sentry-sdk>=2,<3`; vendored into each lambda by `phase3`, installed into the container image by `phase2`.
+
+See [docs/SENTRY_SETUP.md](docs/SENTRY_SETUP.md) for the project-creation walkthrough, deeper detail on what each component reports, and how to disable / rotate / extend (Phase 4 gateway, tracing).
+
 ## Cost Estimate (10 active users)
 
 | Component | Monthly |
@@ -346,6 +379,7 @@ Key settings in `cdk.json`:
 | [DISCORD_SETUP.md](docs/DISCORD_SETUP.md) | Discord bot configuration |
 | [FEISHU_SETUP.md](docs/FEISHU_SETUP.md) | Feishu (Lark) bot configuration |
 | [GITHUB_SETUP.md](docs/GITHUB_SETUP.md) | GitHub org-level webhook for @-mention triggers |
+| [SENTRY_SETUP.md](docs/SENTRY_SETUP.md) | Sentry observability — per-component DSN setup |
 | [AGENTCORE_CONTRACT.md](docs/AGENTCORE_CONTRACT.md) | HTTP contract protocol details |
 
 ## Reference

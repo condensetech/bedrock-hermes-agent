@@ -24,6 +24,34 @@ import boto3
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Sentry — observability sink (best-effort, silently disabled if no DSN)
+import sentry_sdk  # noqa: E402 — vendored into this dir by phase3
+
+
+def _init_sentry(dsn_secret_name: str) -> None:
+    try:
+        sm = boto3.client("secretsmanager")
+        dsn = sm.get_secret_value(SecretId=dsn_secret_name)["SecretString"]
+    except Exception:
+        return
+    if not dsn:
+        return
+    try:
+        from sentry_sdk.integrations.aws_lambda import AwsLambdaIntegration
+        sentry_sdk.init(
+            dsn=dsn,
+            integrations=[AwsLambdaIntegration(timeout_warning=True)],
+            environment=os.environ.get("DEPLOYMENT_ENV", "production"),
+            release=os.environ.get("RELEASE_SHA") or None,
+            traces_sample_rate=0.0,
+            send_default_pii=False,
+        )
+    except Exception:
+        pass
+
+
+_init_sentry("hermes/sentry-dsn-token-metrics")
+
 cloudwatch = boto3.client("cloudwatch")
 sns = boto3.client("sns")
 

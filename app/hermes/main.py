@@ -40,6 +40,44 @@ def _get_region() -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Sentry — observability sink (best-effort, silently disabled if no DSN)
+# ---------------------------------------------------------------------------
+
+import sentry_sdk  # noqa: E402
+
+
+def _init_sentry(dsn_secret_name: str) -> None:
+    """Best-effort Sentry init at module load. Reads the DSN from Secrets
+    Manager (the container's IAM role already grants secretsmanager:Get on
+    hermes/*). Missing secret or any failure leaves Sentry uninitialised —
+    sentry_sdk top-level calls become no-ops, so the agent runs fine
+    without observability if the DSN isn't configured."""
+    try:
+        import boto3  # local — keeps the failure path tight
+        sm = boto3.client("secretsmanager", region_name=_get_region())
+        dsn = sm.get_secret_value(SecretId=dsn_secret_name)["SecretString"]
+    except Exception:
+        return
+    if not dsn:
+        return
+    try:
+        sentry_sdk.init(
+            dsn=dsn,
+            # LoggingIntegration is auto-enabled; logger.exception/error
+            # become Sentry events without explicit capture_exception calls.
+            environment=os.environ.get("DEPLOYMENT_ENV", "production"),
+            release=os.environ.get("RELEASE_SHA") or None,
+            traces_sample_rate=0.0,
+            send_default_pii=False,
+        )
+    except Exception:
+        pass
+
+
+_init_sentry("hermes/sentry-dsn-runtime")
+
+
 class _PatchedAnthropic:
     """Drop-in replacement for anthropic.Anthropic that uses Bedrock."""
 

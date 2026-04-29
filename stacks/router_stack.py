@@ -87,6 +87,9 @@ class HermesRouterStack(Stack):
                 "AGENTCORE_QUALIFIER": agentcore_qualifier,
                 "IDENTITY_TABLE": self.identity_table.table_name,
                 "S3_BUCKET": bucket_name,
+                # Stamped at deploy time by scripts/deploy.sh — surfaces in
+                # Sentry events as the `release` field.
+                "RELEASE_SHA": self.node.try_get_context("release_sha") or "",
             },
             log_retention=logs.RetentionDays.ONE_MONTH,
         )

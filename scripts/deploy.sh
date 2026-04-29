@@ -19,6 +19,18 @@ PHASE="${1:-all}"
 PROJECT_NAME="hermes-agentcore"
 RUNTIME_NAME="hermes_agent"
 
+# Resolve the current commit SHA for release tagging in Sentry / CloudWatch.
+# Empty (untagged) is fine for repos without git history; the env var is
+# treated as optional everywhere it's read.
+if git -C "$PROJECT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    RELEASE_SHA="$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo '')"
+    if ! git -C "$PROJECT_DIR" diff-index --quiet HEAD -- 2>/dev/null; then
+        RELEASE_SHA="${RELEASE_SHA}-dirty"
+    fi
+else
+    RELEASE_SHA=""
+fi
+
 # Activate virtual environment if present.
 if [ -f "$PROJECT_DIR/.venv/bin/activate" ]; then
     # shellcheck disable=SC1091
@@ -150,10 +162,11 @@ TARGETS
         error "Missing agentcore/agentcore.json.template — cannot render runtime config."
         exit 1
     fi
-    jq --arg model "$MODEL_ID" --arg bucket "$BUCKET_NAME" --arg role "$EXECUTION_ROLE_ARN" '
+    jq --arg model "$MODEL_ID" --arg bucket "$BUCKET_NAME" --arg role "$EXECUTION_ROLE_ARN" --arg sha "$RELEASE_SHA" '
         .runtimes[0].envVars = (
             [{"name": "BEDROCK_MODEL_ID", "value": $model}]
             + (if $bucket != "" then [{"name": "S3_BUCKET", "value": $bucket}] else [] end)
+            + (if $sha != "" then [{"name": "RELEASE_SHA", "value": $sha}] else [] end)
         )
         | (if $role != "" then .runtimes[0].executionRoleArn = $role else . end)
     ' "$PROJECT_DIR/agentcore/agentcore.json.template" > "$PROJECT_DIR/agentcore/agentcore.json"
@@ -229,10 +242,28 @@ phase3() {
             pynacl
     fi
 
+    # Vendor sentry-sdk + transitive deps (certifi, urllib3) into each
+    # lambda. Pure Python install. Lambda Python 3.13 ships urllib3 via
+    # botocore but NOT certifi, so we install with full deps; vendored
+    # urllib3 ends up shadowing the runtime's, which is fine — sentry-sdk
+    # supports the urllib3 versions it depends on.
+    for ldir in lambda/router lambda/cron lambda/token_metrics; do
+        if [ ! -d "$PROJECT_DIR/$ldir/sentry_sdk" ]; then
+            info "Installing sentry-sdk into $ldir …"
+            pip install --quiet \
+                --target "$PROJECT_DIR/$ldir/" \
+                --platform manylinux2014_x86_64 \
+                --python-version 3.13 \
+                --only-binary=:all: \
+                "sentry-sdk>=2,<3"
+        fi
+    done
+
     $CDK deploy \
         "${PROJECT_NAME}-router" \
         "${PROJECT_NAME}-cron" \
         "${PROJECT_NAME}-token-monitoring" \
+        --context "release_sha=${RELEASE_SHA}" \
         --require-approval never
 
     # Print API URL.

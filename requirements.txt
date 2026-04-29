@@ -9,3 +9,8 @@ litellm>=1.40.0
 
 # Recipe loader (deploy.sh and app/hermes/main.py)
 pyyaml>=6.0,<7
+
+# Observability — vendored into each lambda by phase3 too (so it's
+# present in the deploy zip), but listed here so the dev venv / tests
+# can import it without running phase3 first.
+sentry-sdk>=2,<3

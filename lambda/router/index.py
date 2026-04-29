@@ -54,6 +54,42 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# --------------------------------------------------------------------------
+# Sentry — observability sink (best-effort, silently disabled if no DSN)
+# --------------------------------------------------------------------------
+
+import sentry_sdk  # noqa: E402  — vendored into this dir by phase3
+
+
+def _init_sentry(dsn_secret_name: str) -> None:
+    """Best-effort Sentry init at module load. Missing secret or any
+    failure leaves Sentry uninitialised — top-level sentry_sdk.set_tag /
+    capture_exception calls are no-ops in that state, so the lambda runs
+    fine without observability if the DSN isn't configured."""
+    try:
+        sm = boto3.client("secretsmanager")
+        dsn = sm.get_secret_value(SecretId=dsn_secret_name)["SecretString"]
+    except Exception:
+        return
+    if not dsn:
+        return
+    try:
+        from sentry_sdk.integrations.aws_lambda import AwsLambdaIntegration
+        sentry_sdk.init(
+            dsn=dsn,
+            integrations=[AwsLambdaIntegration(timeout_warning=True)],
+            environment=os.environ.get("DEPLOYMENT_ENV", "production"),
+            release=os.environ.get("RELEASE_SHA") or None,
+            traces_sample_rate=0.0,
+            send_default_pii=False,
+        )
+    except Exception:
+        # Don't let observability setup break the lambda.
+        pass
+
+
+_init_sentry("hermes/sentry-dsn-router")
+
 # ---- AWS clients (reused across invocations) -----------------------------
 
 dynamodb = boto3.resource("dynamodb")
@@ -268,6 +304,10 @@ def _dispatch_or_queue(
         prompt acknowledgement; the in-flight followup will pick up the
         item when it finishes its current turn.
     """
+    # Sentry context — surfaces in every event raised during this request.
+    sentry_sdk.set_tag("channel", channel)
+    sentry_sdk.set_tag("actor_id", actor_id)
+
     item = {
         "channel": channel,
         "actor_id": actor_id,
@@ -321,6 +361,8 @@ def _process_followup(ctx: dict) -> dict:
         "Followup: channel=%s actor=%s msg=%r",
         channel, actor_id, (agent_payload.get("message") or "")[:50],
     )
+    sentry_sdk.set_tag("channel", channel)
+    sentry_sdk.set_tag("actor_id", actor_id)
 
     try:
         agent_response = _invoke_agentcore(session_id, actor_id, agent_payload)

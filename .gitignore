@@ -55,6 +55,19 @@ lambda/router/cffi/
 lambda/router/_cffi_backend*
 lambda/router/pycparser/
 lambda/router/*.dist-info/
+# sentry-sdk vendored into each lambda by phase3 (with its deps:
+# certifi, urllib3)
+lambda/router/sentry_sdk/
+lambda/router/certifi/
+lambda/router/urllib3/
+lambda/cron/sentry_sdk/
+lambda/cron/certifi/
+lambda/cron/urllib3/
+lambda/token_metrics/sentry_sdk/
+lambda/token_metrics/certifi/
+lambda/token_metrics/urllib3/
+lambda/cron/*.dist-info/
+lambda/token_metrics/*.dist-info/
 
 # Docker / submodule
 hermes-agent/

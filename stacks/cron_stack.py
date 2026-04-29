@@ -51,6 +51,9 @@ class HermesCronStack(Stack):
             environment={
                 "AGENTCORE_RUNTIME_ARN": agentcore_runtime_arn,
                 "AGENTCORE_QUALIFIER": agentcore_qualifier,
+                # Stamped at deploy time by scripts/deploy.sh — surfaces in
+                # Sentry events as the `release` field.
+                "RELEASE_SHA": self.node.try_get_context("release_sha") or "",
             },
             log_retention=logs.RetentionDays.ONE_MONTH,
         )
