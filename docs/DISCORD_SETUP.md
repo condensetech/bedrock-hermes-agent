@@ -29,12 +29,21 @@ The script:
 After initial setup the most common follow-ups are:
 
 ```bash
-# Add more Discord users to the allowlist (no other state change)
-./scripts/setup_discord.sh allow 284102345871466496 198765432109876543
+# Add more Discord users to the allowlist (works for any channel, not just Discord)
+./scripts/allow_user.sh add discord 284102345871466496 198765432109876543
+
+# List current allowlist (all channels, or filter by channel)
+./scripts/allow_user.sh list
+./scripts/allow_user.sh list discord
+
+# Remove a user
+./scripts/allow_user.sh rm discord 284102345871466496
 
 # Re-register /ask if you change command schema or wipe global commands
 ./scripts/setup_discord.sh command APP_ID BOT_TOKEN GUILD_ID
 ```
+
+`./scripts/setup_discord.sh allow ...` is also available as a Discord-specific shortcut that delegates to `allow_user.sh`.
 
 ## What still requires the Discord UI
 
@@ -85,7 +94,7 @@ The Lambda returns Discord's deferred response (`type: 5`) immediately and async
 | `ModuleNotFoundError: No module named 'nacl'` | PyNaCl wasn't bundled into `lambda/router/` (it's gitignored) | `pip install --target lambda/router/ --platform manylinux2014_x86_64 --python-version 3.13 --only-binary=:all: pynacl` then `cdk deploy hermes-agentcore-router` |
 | `Discord verify: non-hexadecimal number found in fromhex()` | The public key in Secrets Manager isn't 64 hex chars (copy-paste mishap, JSON wrapping, etc.) | Re-copy from Discord's General Information page; the script validates this if you re-run it |
 | Slash-command POST returns `{"code": 50001}` | Bot isn't in the guild yet (or was invited without `applications.commands` scope) | Open the invite URL the script printed; it includes `scope=bot+applications.commands` |
-| `/ask` replies "Access denied." | User not in DynamoDB allowlist | `./scripts/setup_discord.sh allow YOUR_DISCORD_USER_ID` |
+| `/ask` replies "Access denied." | User not in DynamoDB allowlist | `./scripts/allow_user.sh add discord YOUR_DISCORD_USER_ID` |
 | `/ask` shows "This interaction failed" | AgentCore took longer than Discord's edit timeout (~15 min) on a cold start | Pre-warm: `agentcore invoke "ping" --stream --runtime hermes` |
 
 For deeper debugging:

@@ -64,19 +64,6 @@ put_secret() {
     fi
 }
 
-allowlist_user() {
-    local user_id="$1"
-    aws dynamodb put-item \
-        --table-name "$TABLE_NAME" \
-        --item "{
-            \"PK\": {\"S\": \"ALLOW#discord:${user_id}\"},
-            \"SK\": {\"S\": \"ALLOW\"},
-            \"userId\": {\"S\": \"discord:${user_id}\"},
-            \"platform\": {\"S\": \"discord\"},
-            \"createdAt\": {\"N\": \"$(date +%s)\"}
-        }" >/dev/null
-}
-
 register_slash_command() {
     local app_id="$1" bot_token="$2" guild_id="${3:-}"
     local url
@@ -114,18 +101,8 @@ cmd_allow() {
         error "Usage: $0 allow USER_ID [USER_ID ...]"
         exit 1
     fi
-    for uid in "$@"; do
-        if ! is_numeric_id "$uid"; then
-            warn "Skipping '$uid' — Discord User IDs are 15-25 digit numbers."
-            continue
-        fi
-        info "Allowlisting discord:${uid}"
-        allowlist_user "$uid"
-    done
-    info "Done. Verify:"
-    echo "  aws dynamodb scan --table-name ${TABLE_NAME} \\"
-    echo "    --filter-expression 'begins_with(PK, :p)' \\"
-    echo "    --expression-attribute-values '{\":p\":{\"S\":\"ALLOW#discord:\"}}'"
+    "$(dirname "$0")/allow_user.sh" add discord "$@"
+    info "Verify with: $(dirname "$0")/allow_user.sh list discord"
 }
 
 cmd_command() {

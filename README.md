@@ -204,6 +204,14 @@ Configure webhooks after Phase 3 deployment:
 
 The Discord script is interactive — it walks you through the manual steps in the Discord Developer Portal, validates inputs, stores secrets, registers the `/ask` slash command, and seeds the DynamoDB allowlist. See [docs/DISCORD_SETUP.md](docs/DISCORD_SETUP.md) for details and troubleshooting.
 
+To add/remove users from the allowlist later (any channel — telegram, slack, discord, feishu, weixin):
+
+```bash
+./scripts/allow_user.sh add discord 284102345871466496
+./scripts/allow_user.sh list
+./scripts/allow_user.sh rm telegram 555111222
+```
+
 ### WeChat (Phase 4 — ECS Gateway)
 
 WeChat uses the **iLink Bot API** (`ilinkai.weixin.qq.com`) for personal WeChat accounts. It requires a persistent long-poll connection and is only available via the Phase 4 ECS gateway.
