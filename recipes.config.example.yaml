@@ -1,0 +1,34 @@
+# Example recipes.config.yaml — copy to `recipes.config.yaml` (or commit
+# this filename per environment) and edit. The deploy script reads
+# ${RECIPES_CONFIG:-recipes.config.yaml}, so you can pin per-env files
+# with e.g. `RECIPES_CONFIG=recipes.config.prod.yaml ./scripts/deploy.sh phase2`.
+#
+# Track this file or gitignore it — your call. Tracking it makes the active
+# integration set reproducible from CI; gitignoring is right for personal /
+# experimental setups.
+#
+# Merge semantics for `overrides:`
+#   - dicts: deep-merge per-key
+#   - lists: replace (write the whole list when overriding)
+#   - scalars: replace
+#
+# Available stock recipes are folders under recipes/. Use `path:` instead
+# of `name:` to point at a recipe directory outside this repo.
+
+recipes:
+  # Stock recipe, no customization:
+  # - name: sentry
+
+  # Stock recipe with overrides — pass --organization-slug to scope queries:
+  # - name: sentry
+  #   overrides:
+  #     mcp_servers:
+  #       sentry:
+  #         args:
+  #           - "-y"
+  #           - "@sentry/mcp-server@latest"
+  #           - "--organization-slug=my-org"
+
+  # Custom recipe outside the repo:
+  # - name: internal-mcp
+  #   path: ../infra/recipes/internal-mcp

@@ -50,6 +50,16 @@ COPY bridge/ /app/bridge/
 # Copy main entrypoint.
 COPY main.py /app/main.py
 
+# Recipes — opt-in integrations. Synced into app/hermes/recipes/ by
+# scripts/deploy.sh phase2 (gitignored, regenerated each build). The
+# manifest is a single JSON file the runtime reads to populate secrets
+# and merge MCP servers into hermes-agent's config.yaml.
+COPY recipes/ /app/recipes/
+COPY recipes_manifest.json /app/recipes_manifest.json
+RUN for d in /app/recipes/*/; do \
+        [ -f "${d}install.sh" ] && bash "${d}install.sh"; \
+    done; true
+
 # Make everything importable.
 ENV PYTHONPATH="/app:/app/hermes-agent"
 

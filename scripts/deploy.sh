@@ -111,6 +111,13 @@ TARGETS
     rsync -a --delete --exclude='__pycache__' --exclude='Dockerfile' \
         "$PROJECT_DIR/bridge/" "$PROJECT_DIR/app/hermes/bridge/"
 
+    # Resolve recipes.config.yaml: deep-merge per-recipe overrides into the
+    # stock recipes/, validate secrets, sync into the Docker build context,
+    # and emit app/hermes/recipes_manifest.json. All logic is in
+    # scripts/_build_recipes.py — keep deploy.sh thin.
+    info "Resolving ${RECIPES_CONFIG:-recipes.config.yaml} …"
+    PROJECT_DIR="$PROJECT_DIR" python3 "$PROJECT_DIR/scripts/_build_recipes.py"
+
     # Render agentcore/agentcore.json from agentcore/agentcore.json.template.
     # The rendered file embeds per-deployment values (account ID, role ARN,
     # bucket name) and is gitignored — only the template is tracked.

@@ -147,21 +147,26 @@ def _ensure_workspace(session_id: str | None) -> None:
 
 _agent = None
 
-# Channel tokens fetched from Secrets Manager into env vars.  hermes-agent's
-# built-in tools (e.g. tools/discord_tool.py) gate on these env vars via
-# their check_fn, so populating them before AIAgent() makes the tool schema
-# self-register.
-_CHANNEL_SECRET_ENV = {
+# Built-in channel tokens (Secrets Manager → env var). Populated for every
+# deployment because the corresponding hermes-agent tools gate on the env
+# var via their check_fn.  Recipes contribute additional secrets via the
+# manifest at /app/recipes_manifest.json.
+_BUILTIN_CHANNEL_SECRETS = {
     "hermes/discord-bot-token": "DISCORD_BOT_TOKEN",
 }
 
+_RECIPES_MANIFEST_PATH = "/app/recipes_manifest.json"
 
-def _populate_channel_secrets() -> None:
-    """Fetch channel API tokens from Secrets Manager and expose them as env
-    vars so hermes-agent's built-in channel tools opt in automatically."""
+
+def _populate_secrets(secrets: dict) -> None:
+    """Fetch each ``SecretId → ENV_VAR`` from Secrets Manager and export the
+    value as the named env var.  No-op if the env var is already set or the
+    secret doesn't exist."""
+    if not secrets:
+        return
     import boto3
     sm = boto3.client("secretsmanager", region_name=_get_region())
-    for secret_id, env_var in _CHANNEL_SECRET_ENV.items():
+    for secret_id, env_var in secrets.items():
         if os.environ.get(env_var):
             continue
         try:
@@ -170,6 +175,92 @@ def _populate_channel_secrets() -> None:
             log.info("Loaded %s into %s", secret_id, env_var)
         except Exception as exc:
             log.info("Skipped %s (%s)", secret_id, type(exc).__name__)
+
+
+def _load_recipes_manifest() -> dict:
+    """Read the recipe manifest emitted by ``scripts/deploy.sh phase2``.
+
+    Returns ``{"secrets": {...}, "mcp_servers": {...}}``.  Empty/missing
+    file yields empty dicts so the caller can iterate unconditionally."""
+    if not os.path.exists(_RECIPES_MANIFEST_PATH):
+        return {"secrets": {}, "mcp_servers": {}}
+    try:
+        with open(_RECIPES_MANIFEST_PATH) as fh:
+            data = json.load(fh) or {}
+    except Exception as exc:
+        log.warning("Could not parse %s: %s", _RECIPES_MANIFEST_PATH, exc)
+        return {"secrets": {}, "mcp_servers": {}}
+    return {
+        "secrets": data.get("secrets") or {},
+        "mcp_servers": data.get("mcp_servers") or {},
+    }
+
+
+def _merge_recipe_mcp_servers(servers: dict) -> None:
+    """Merge recipe-contributed MCP servers into hermes-agent's config.yaml.
+
+    hermes-agent reads ``mcp_servers`` from ``${HERMES_HOME}/config.yaml``
+    and interpolates ``${VAR}`` against ``os.environ`` — so secrets stay in
+    env vars (populated by ``_populate_secrets``), not in the file.
+
+    A side-file (``.recipe_managed_servers.json``) tracks which keys are
+    recipe-managed; on every startup we drop those before re-adding the
+    current set, so disabling a recipe doesn't leave stale entries when
+    the workspace is restored from S3."""
+    if not servers:
+        return
+    try:
+        import yaml
+    except ImportError:
+        log.error("pyyaml not installed; cannot apply recipe mcp_servers")
+        return
+
+    home = os.environ.get("HERMES_HOME", "/mnt/workspace/.hermes")
+    config_path = os.path.join(home, "config.yaml")
+    state_path = os.path.join(home, ".recipe_managed_servers.json")
+
+    config: dict = {}
+    if os.path.exists(config_path):
+        try:
+            with open(config_path) as fh:
+                config = yaml.safe_load(fh) or {}
+        except Exception as exc:
+            log.warning("Could not parse %s: %s", config_path, exc)
+            config = {}
+
+    previously_managed: list[str] = []
+    if os.path.exists(state_path):
+        try:
+            with open(state_path) as fh:
+                previously_managed = json.load(fh) or []
+        except Exception:
+            previously_managed = []
+
+    mcp = config.get("mcp_servers") or {}
+    for name in previously_managed:
+        mcp.pop(name, None)
+    mcp.update(servers)
+    config["mcp_servers"] = mcp
+
+    os.makedirs(home, exist_ok=True)
+    with open(config_path, "w") as fh:
+        yaml.safe_dump(config, fh, sort_keys=False)
+    with open(state_path, "w") as fh:
+        json.dump(list(servers.keys()), fh)
+
+    log.info(
+        "Recipe mcp_servers merged into %s: %s",
+        config_path, ", ".join(servers.keys()),
+    )
+
+
+def _apply_runtime_config() -> None:
+    """Run all build-time-driven runtime setup before AIAgent init: load
+    built-in channel secrets, then read the recipes manifest and apply it."""
+    _populate_secrets(_BUILTIN_CHANNEL_SECRETS)
+    manifest = _load_recipes_manifest()
+    _populate_secrets(manifest["secrets"])
+    _merge_recipe_mcp_servers(manifest["mcp_servers"])
 
 
 # Per-request context — set by ``invoke()`` before each agent run, read by
@@ -227,7 +318,7 @@ def get_or_create_agent(channel: str = "agentcore"):
     os.environ.setdefault("AWS_DEFAULT_REGION", region)
     os.environ.setdefault("AWS_REGION", region)
 
-    _populate_channel_secrets()
+    _apply_runtime_config()
 
     import run_agent
 

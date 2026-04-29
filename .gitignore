@@ -59,3 +59,8 @@ lambda/router/*.dist-info/
 # Docker / submodule
 hermes-agent/
 gateway/hermes-agent/
+
+# Recipes — build artefacts
+app/hermes/recipes/
+app/hermes/recipes_manifest.json
+recipes.config.yaml
