@@ -126,6 +126,8 @@ def handler(event: dict, context: Any) -> dict:
             return _handle_discord(event)
         elif path.startswith("/webhook/feishu"):
             return _handle_feishu(event)
+        elif path.startswith("/webhook/github"):
+            return _handle_github(event)
         elif path == "/health":
             return _ok({"status": "healthy", "timestamp": int(time.time())})
         else:
@@ -303,8 +305,17 @@ def _process_followup(ctx: dict) -> dict:
     agent_payload = ctx["agent_payload"]
     delivery = ctx["delivery"]
 
-    user_id = agent_payload.get("userId", "")
-    session_id = _build_session_id(user_id, channel)
+    if channel == "github":
+        # GitHub events are scoped to a (repo, PR) thread rather than a
+        # user — multiple commenters in the same PR share conversation
+        # continuity, which is what the agent should see.
+        session_id = _build_session_id(
+            f"{delivery['repo_full_name']}#{delivery['issue_number']}",
+            channel,
+        )
+    else:
+        user_id = agent_payload.get("userId", "")
+        session_id = _build_session_id(user_id, channel)
 
     logger.info(
         "Followup: channel=%s actor=%s msg=%r",
@@ -313,17 +324,15 @@ def _process_followup(ctx: dict) -> dict:
 
     try:
         agent_response = _invoke_agentcore(session_id, actor_id, agent_payload)
-        _deliver_response(channel, delivery, agent_response)
-    except Exception:
+        _finalize(channel, delivery, agent_response, success=True)
+    except Exception as exc:
         logger.exception("Followup processing failed")
-        # Best-effort error delivery so the user isn't left hanging.
-        try:
-            _deliver_response(
-                channel, delivery,
-                "Sorry, I couldn't process your message right now.",
-            )
-        except Exception:
-            logger.exception("Error-delivery also failed")
+        _finalize(
+            channel, delivery,
+            f"Sorry, I couldn't process your message right now "
+            f"({type(exc).__name__}: {exc}).",
+            success=False,
+        )
 
     # Drain queue, hand off lock if more work; release otherwise.
     next_item = _dequeue(actor_id)
@@ -354,12 +363,53 @@ def _process_followup(ctx: dict) -> dict:
 
 
 def _process_queued_notice(ctx: dict) -> dict:
-    """Send the per-channel 'Queued — will reply soon' message."""
+    """Send the per-channel 'Queued — will reply soon' message.
+
+    Github is special-cased: the webhook handler already added an "eyes"
+    reaction to the originating comment before dispatch, so a separate
+    queued-notice would be a redundant comment. Skip it.
+    """
+    if ctx.get("channel") == "github":
+        return _ok({"status": "ok", "skipped": "github_eyes_reaction"})
     try:
         _deliver_response(ctx["channel"], ctx["delivery"], QUEUED_MESSAGE)
     except Exception:
         logger.exception("Queued-notice delivery failed")
     return _ok({"status": "ok"})
+
+
+def _finalize(channel: str, delivery: dict, text: str, success: bool) -> None:
+    """Deliver the final reply and apply any per-channel completion signals.
+
+    For github: posts the agent's text as a comment when ``auto_post_response``
+    is True (the comment-triggered flow) or when the agent failed (so the
+    user always sees what went wrong, even on the review-requested flow
+    where success is signalled by the agent's own ``create_pull_request_review``
+    call). Adds a 🚀 (success) or 😕 (failure) reaction to the originating
+    comment when one exists, alongside the in-progress 👀 the webhook
+    handler added at dispatch time.
+    """
+    if channel == "github":
+        if delivery.get("auto_post_response", True) or not success:
+            try:
+                _post_github_comment(
+                    delivery["repo_full_name"],
+                    delivery["issue_number"],
+                    text,
+                )
+            except Exception:
+                logger.exception("Github fallback comment failed")
+        comment_id = delivery.get("comment_id")
+        if comment_id:
+            _react_to_github_comment(
+                delivery["repo_full_name"], comment_id,
+                "rocket" if success else "confused",
+            )
+        return
+    try:
+        _deliver_response(channel, delivery, text)
+    except Exception:
+        logger.exception("Final delivery to %s failed", channel)
 
 
 def _deliver_response(channel: str, delivery: dict, text: str) -> None:
@@ -380,6 +430,10 @@ def _deliver_response(channel: str, delivery: dict, text: str) -> None:
     elif channel == "feishu":
         _send_feishu_message(
             delivery["chat_id"], delivery.get("message_id", ""), text,
+        )
+    elif channel == "github":
+        _post_github_comment(
+            delivery["repo_full_name"], delivery["issue_number"], text,
         )
     else:
         logger.error("Unknown channel for delivery: %s", channel)
@@ -788,6 +842,452 @@ def _send_feishu_message(chat_id: str, message_id: str, text: str) -> None:
         logger.error("Feishu reply failed: %s", exc)
 
 
+# --------------------------------------------------------------------------
+# GitHub
+# --------------------------------------------------------------------------
+#
+# Org-level webhook routed here. Trigger: ``@<bot_login>`` mentions in
+# issue/PR comments. The bot login is auto-discovered from the existing
+# ``hermes/github-token`` PAT (calls GET /user once per cold start).
+#
+# Public-repo events are blocked by default — explicit opt-in per repo via
+# DDB (key: ``GHPUBLIC#<owner>/<repo>``) since the agent has access to
+# private observability data and we don't want it leaking via public
+# comments. Toggle with ``./scripts/setup_github_webhook.sh
+# allow-public/deny-public``.
+
+_bot_login_cache: Optional[str] = None
+
+
+def _get_bot_login() -> str:
+    """Resolve the GitHub login of the PAT owner. Cached per cold start."""
+    global _bot_login_cache
+    if _bot_login_cache is not None:
+        return _bot_login_cache
+
+    token = _get_secret("github-token")
+    req = urllib.request.Request(
+        "https://api.github.com/user",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "HermesAgent/1.0",
+        },
+    )
+    try:
+        body = json.loads(urllib.request.urlopen(req, timeout=10).read())
+        _bot_login_cache = body.get("login", "")
+    except Exception as exc:
+        logger.error("Failed to resolve bot login from GET /user: %s", exc)
+        _bot_login_cache = ""
+    return _bot_login_cache
+
+
+def _verify_github_signature(event: dict, secret: str) -> bool:
+    """Verify GitHub's X-Hub-Signature-256 header (HMAC SHA-256)."""
+    headers = event.get("headers", {})
+    signature = headers.get("x-hub-signature-256", "")
+    if not signature.startswith("sha256="):
+        return False
+
+    raw_body = event.get("body", "")
+    if event.get("isBase64Encoded") and raw_body:
+        import base64
+        raw_body_bytes = base64.b64decode(raw_body)
+    else:
+        raw_body_bytes = raw_body.encode() if isinstance(raw_body, str) else raw_body
+
+    expected = "sha256=" + hmac.new(
+        secret.encode(), raw_body_bytes, hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _is_public_repo_opted_in(repo_full_name: str) -> bool:
+    """Check whether ``owner/repo`` has been explicitly opted in for events
+    in public repos. Closed-by-default semantics: missing record → no."""
+    try:
+        resp = identity_table.get_item(
+            Key={"PK": f"GHPUBLIC#{repo_full_name}", "SK": "ALLOW"},
+        )
+        return "Item" in resp
+    except ClientError:
+        return False
+
+
+def _handle_github(event: dict) -> dict:
+    """Top-level dispatcher. Verify signature, then route by GitHub event type."""
+    # Webhook secret presence is also the on/off switch for the integration.
+    try:
+        secret = _get_secret("github-webhook-secret")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+            logger.info("GitHub integration disabled (no webhook secret set)")
+            return _ok({"status": "disabled"}, status=404)
+        raise
+
+    if not _verify_github_signature(event, secret):
+        logger.warning("GitHub signature verification failed")
+        return _ok({"error": "Invalid signature"}, status=401)
+
+    headers = event.get("headers", {})
+    gh_event = headers.get("x-github-event", "")
+
+    # GitHub fires a "ping" once when a webhook is registered. ACK and exit.
+    if gh_event == "ping":
+        return _ok({"status": "pong"})
+
+    body = _parse_body(event)
+    action = body.get("action", "")
+
+    if gh_event == "issue_comment" and action == "created":
+        return _handle_github_comment(body)
+    if gh_event in ("issues", "pull_request") and action == "closed":
+        return _handle_github_close(body)
+    if gh_event == "pull_request" and action == "review_requested":
+        return _handle_github_review_requested(body)
+
+    return _ok({"status": "ignored", "event": gh_event, "action": action})
+
+
+def _handle_github_comment(body: dict) -> dict:
+    """Process an `issue_comment.created` event. Trigger if the comment
+    @-mentions our bot, the author is allowlisted, and (for public repos)
+    the repo is opted in."""
+    repo = body.get("repository", {}) or {}
+    repo_full_name = repo.get("full_name", "")
+    is_private = bool(repo.get("private"))
+    issue = body.get("issue", {}) or {}
+    issue_number = issue.get("number")
+    comment = body.get("comment", {}) or {}
+    comment_body = comment.get("body", "") or ""
+    comment_url = comment.get("html_url", "")
+    comment_id = comment.get("id")
+    author = (comment.get("user") or {}).get("login", "")
+
+    if not repo_full_name or not issue_number or not author:
+        return _ok({"status": "malformed"})
+
+    bot_login = _get_bot_login()
+    if not bot_login:
+        logger.error("Cannot derive bot login; rejecting all events")
+        return _ok({"status": "no_bot_login"}, status=500)
+
+    # Trigger: explicit @<bot_login> mention in the body. Match against the
+    # whole word so "@condense-hermes-clone" doesn't trigger a bot named
+    # "condense-hermes". GitHub usernames are case-insensitive in mentions
+    # but stored in their registered casing — match case-insensitive.
+    needle = f"@{bot_login}".lower()
+    body_lower = comment_body.lower()
+    if needle not in body_lower:
+        return _ok({"status": "no_mention"})
+    idx = body_lower.find(needle)
+    after = body_lower[idx + len(needle): idx + len(needle) + 1]
+    if after and (after.isalnum() or after in "-_."):
+        return _ok({"status": "partial_match"})
+
+    if author.lower() == bot_login.lower():
+        return _ok({"status": "self_mention"})
+
+    actor_id = f"github:{author}"
+    if not _is_allowed(actor_id):
+        logger.info("Blocked github mention from %s (not in allowlist)", actor_id)
+        # Signal "you can't do that" via a thumbs-down reaction, no comment.
+        _react_to_github_comment(repo_full_name, comment_id, "-1")
+        return _ok({"status": "blocked"})
+
+    if not is_private and not _is_public_repo_opted_in(repo_full_name):
+        logger.info(
+            "Blocked github mention in public repo %s (not opted in)", repo_full_name,
+        )
+        _react_to_github_comment(repo_full_name, comment_id, "-1")
+        return _ok({"status": "public_repo_not_opted_in"})
+
+    # Acknowledge the mention immediately with an "eyes" reaction so the
+    # commenter sees we received it. The agent's full reply lands later as
+    # a comment on the same thread.
+    _react_to_github_comment(repo_full_name, comment_id, "eyes")
+
+    hermes_user_id = _resolve_user(actor_id, username=author)
+
+    # Build the agent prompt. Gives the model enough context to act:
+    # repo, issue/PR, the comment that mentioned it, who wrote it, and the
+    # canonical URL so it can self-fetch the diff/details if needed.
+    prompt = (
+        f"You were @-mentioned in a GitHub comment.\n\n"
+        f"Repository: {repo_full_name}\n"
+        f"Issue/PR #{issue_number}: {issue.get('title', '')}\n"
+        f"Comment author: @{author}\n"
+        f"Comment URL: {comment_url}\n"
+        f"Comment body:\n---\n{comment_body}\n---\n\n"
+        f"Decide what's appropriate based on the request. Your reply will "
+        f"be posted as a comment on the same thread; you may also use the "
+        f"github tools for richer interactions (file reads, reviews, PR "
+        f"creation, etc.) as the request demands."
+    )
+
+    agent_payload = {
+        "action": "chat",
+        "userId": hermes_user_id,
+        "actorId": actor_id,
+        "channel": "github",
+        "chatId": f"{repo_full_name}#{issue_number}",
+        "message": prompt,
+    }
+    delivery = {
+        "repo_full_name": repo_full_name,
+        "issue_number": issue_number,
+        "comment_url": comment_url,
+        "comment_id": comment_id,
+        # Comment-triggered: the agent's text response IS the reply, so
+        # the lambda fallback-posts it as a comment on the same thread.
+        "auto_post_response": True,
+    }
+
+    # Per-thread queue: each (repo, issue) gets its own lock so multiple
+    # PRs run in parallel but mentions inside the same PR serialise.
+    thread_actor = f"github:{repo_full_name}#{issue_number}"
+
+    _dispatch_or_queue(
+        actor_id=thread_actor, channel="github",
+        agent_payload=agent_payload, delivery=delivery,
+    )
+    return _ok({"status": "ok"})
+
+
+def _handle_github_review_requested(body: dict) -> dict:
+    """Trigger a code review when the bot is added as a requested reviewer
+    on a PR. The agent posts a structured review via
+    `mcp_github_create_pull_request_review`; the lambda doesn't fallback-post
+    a duplicate comment on success (the review itself is the deliverable),
+    only on failure (so the requester sees what went wrong).
+
+    Team-level reviewer requests (`requested_team`) are ignored — only
+    explicit user-reviewer requests on the bot login trigger this path."""
+    requested = body.get("requested_reviewer") or {}
+    requested_login = requested.get("login", "")
+    if not requested_login:
+        return _ok({"status": "ignored", "reason": "no_user_reviewer"})
+
+    bot_login = _get_bot_login()
+    if not bot_login:
+        logger.error("Cannot derive bot login; rejecting all events")
+        return _ok({"status": "no_bot_login"}, status=500)
+    if requested_login.lower() != bot_login.lower():
+        return _ok({"status": "ignored", "reason": "reviewer_not_bot"})
+
+    pr = body.get("pull_request") or {}
+    pr_number = pr.get("number")
+    pr_title = pr.get("title", "")
+    pr_url = pr.get("html_url", "")
+    repo = body.get("repository", {}) or {}
+    repo_full_name = repo.get("full_name", "")
+    is_private = bool(repo.get("private"))
+
+    # Sender = whoever added the bot as a reviewer. Allowlist gates on them.
+    sender = body.get("sender") or {}
+    sender_login = sender.get("login", "")
+
+    if not repo_full_name or not pr_number or not sender_login:
+        return _ok({"status": "malformed"})
+
+    actor_id = f"github:{sender_login}"
+    if not _is_allowed(actor_id):
+        logger.info(
+            "Blocked review request from %s (sender not in allowlist)", actor_id,
+        )
+        return _ok({"status": "blocked"})
+
+    if not is_private and not _is_public_repo_opted_in(repo_full_name):
+        logger.info(
+            "Blocked review request in public repo %s (not opted in)", repo_full_name,
+        )
+        return _ok({"status": "public_repo_not_opted_in"})
+
+    hermes_user_id = _resolve_user(actor_id, username=sender_login)
+
+    prompt = (
+        f"You were added as a reviewer on a GitHub pull request — run a "
+        f"code review using the four-phase methodology in your system "
+        f"prompt.\n\n"
+        f"Repository: {repo_full_name}\n"
+        f"PR #{pr_number}: {pr_title}\n"
+        f"PR URL: {pr_url}\n"
+        f"Added by: @{sender_login}\n\n"
+        f"Post the review via mcp_github_create_pull_request_review. The "
+        f"review IS the deliverable — your text reply won't be posted as "
+        f"a separate comment on success, so don't write a chat-style "
+        f"response. If you can't complete the review (e.g., the PR is "
+        f"too large to fit in one pass), say so plainly and explain why."
+    )
+
+    agent_payload = {
+        "action": "chat",
+        "userId": hermes_user_id,
+        "actorId": actor_id,
+        "channel": "github",
+        "chatId": f"{repo_full_name}#{pr_number}",
+        "message": prompt,
+    }
+    delivery = {
+        "repo_full_name": repo_full_name,
+        "issue_number": pr_number,  # comment-posting endpoint shares issue space
+        "comment_url": pr_url,
+        # No comment_id — there's no triggering comment to react to.
+        # Agent posts the review via tool; lambda doesn't fallback-post
+        # the agent's text on success, only on failure.
+        "auto_post_response": False,
+    }
+
+    thread_actor = f"github:{repo_full_name}#{pr_number}"
+    _dispatch_or_queue(
+        actor_id=thread_actor, channel="github",
+        agent_payload=agent_payload, delivery=delivery,
+    )
+    return _ok({"status": "ok"})
+
+
+def _handle_github_close(body: dict) -> dict:
+    """An issue or PR was closed — purge per-thread session data so we
+    don't accumulate orphaned workspaces and history."""
+    repo_full_name = (body.get("repository", {}) or {}).get("full_name", "")
+    item = body.get("pull_request") or body.get("issue") or {}
+    number = item.get("number")
+    if not repo_full_name or not number:
+        return _ok({"status": "malformed"})
+
+    session_id = _build_session_id(f"{repo_full_name}#{number}", "github")
+    s3_count = _delete_s3_workspace(session_id)
+    hist_count = _delete_history(session_id)
+    logger.info(
+        "Cleaned up github session %s (s3 objects=%d, history items=%d)",
+        session_id, s3_count, hist_count,
+    )
+    return _ok({"status": "cleaned", "session_id": session_id})
+
+
+def _delete_s3_workspace(session_id: str) -> int:
+    """Delete every object under <session_id>/ in the workspace bucket.
+    Returns how many objects were deleted."""
+    if not S3_BUCKET:
+        return 0
+    deleted = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    try:
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=f"{session_id}/"):
+            objects = [{"Key": obj["Key"]} for obj in page.get("Contents") or []]
+            if not objects:
+                continue
+            # delete_objects supports up to 1000 keys per call.
+            for chunk_start in range(0, len(objects), 1000):
+                chunk = objects[chunk_start: chunk_start + 1000]
+                s3.delete_objects(Bucket=S3_BUCKET, Delete={"Objects": chunk})
+                deleted += len(chunk)
+    except ClientError as exc:
+        logger.warning("S3 cleanup failed for %s: %s", session_id, exc)
+    return deleted
+
+
+def _delete_history(session_id: str) -> int:
+    """Delete all DDB conversation-history items for *session_id*. Items
+    have their own TTL but we expire eagerly on close so the slot is free
+    if someone reopens and re-mentions on the same number."""
+    from boto3.dynamodb.conditions import Key
+
+    deleted = 0
+    try:
+        last_key = None
+        while True:
+            kwargs = {
+                "KeyConditionExpression": Key("PK").eq(f"HIST#{session_id}"),
+                "ProjectionExpression": "PK, SK",
+            }
+            if last_key:
+                kwargs["ExclusiveStartKey"] = last_key
+            resp = identity_table.query(**kwargs)
+            items = resp.get("Items", [])
+            if not items:
+                break
+            with identity_table.batch_writer() as batch:
+                for item in items:
+                    batch.delete_item(Key={"PK": item["PK"], "SK": item["SK"]})
+                    deleted += 1
+            last_key = resp.get("LastEvaluatedKey")
+            if not last_key:
+                break
+    except ClientError as exc:
+        logger.warning("History cleanup failed for %s: %s", session_id, exc)
+    return deleted
+
+
+def _react_to_github_comment(
+    repo_full_name: str, comment_id: Optional[int], content: str,
+) -> None:
+    """Add a reaction to an issue/PR comment via the bot PAT.
+
+    `content` must be one of GitHub's allowed reactions: +1, -1, laugh,
+    confused, heart, hooray, rocket, eyes. Idempotent — reposting the same
+    reaction returns 200, so calling this multiple times is harmless."""
+    if not comment_id:
+        logger.warning("Skipping reaction (%s): no comment_id", content)
+        return
+    token = _get_secret("github-token")
+    url = (
+        f"https://api.github.com/repos/{repo_full_name}/issues/"
+        f"comments/{comment_id}/reactions"
+    )
+    data = json.dumps({"content": content}).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "HermesAgent/1.0",
+    })
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        logger.info(
+            "GitHub reaction %s on %s comment %d: status=%d",
+            content, repo_full_name, comment_id, resp.status,
+        )
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        logger.warning(
+            "GitHub reaction (%s) failed: HTTP %d %s — %s",
+            content, exc.code, exc.reason, body[:300],
+        )
+    except Exception as exc:
+        logger.warning("GitHub reaction (%s) failed: %s", content, exc)
+
+
+def _post_github_comment(repo_full_name: str, issue_number: int, text: str) -> None:
+    """Post the agent's reply as a comment on the same issue/PR thread."""
+    if not text:
+        return
+    token = _get_secret("github-token")
+    url = (
+        f"https://api.github.com/repos/{repo_full_name}/issues/"
+        f"{issue_number}/comments"
+    )
+    data = json.dumps({"body": text[:65000]}).encode()  # GH limit ~65k
+    req = urllib.request.Request(url, data=data, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "HermesAgent/1.0",
+    })
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+        logger.info("GitHub comment post: status=%d", resp.status)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        logger.error(
+            "GitHub comment post failed: %s %s — %s",
+            exc.code, exc.reason, body,
+        )
+    except Exception as exc:
+        logger.error("GitHub comment post failed: %s", exc)
+
+
 def _get_feishu_tenant_token() -> str:
     """Get Feishu tenant_access_token using app credentials."""
     cached = _secrets_cache.get("_feishu_tenant_token")
@@ -866,56 +1366,57 @@ def _save_history(session_id: str, user_message: str, assistant_message: str) ->
 # --------------------------------------------------------------------------
 
 def _invoke_agentcore(session_id: str, actor_id: str, payload: dict) -> str:
-    """Call InvokeAgentRuntime and return the text response."""
+    """Call InvokeAgentRuntime and return the agent's text response.
+
+    Raises on failure — network / throttling / timeout from boto3, or a
+    null/empty agent response. The caller is responsible for surfacing
+    errors to the user (different channels handle the surfacing
+    differently — github wants a reaction + comment; chat channels just
+    a comment)."""
     user_message = payload.get("message", "")
 
     history = _load_history(session_id)
     if history:
         payload["conversationHistory"] = history
 
+    response = _agentcore().invoke_agent_runtime(
+        agentRuntimeArn=RUNTIME_ARN,
+        runtimeSessionId=session_id,
+        runtimeUserId=actor_id,
+        payload=json.dumps(payload).encode("utf-8"),
+    )
+
+    result = response.get("response", "")
+    if hasattr(result, "read"):
+        result = result.read()
+    if isinstance(result, bytes):
+        result = result.decode("utf-8")
+
+    # Parse SSE: strip "data: " and JSON-decode.
+    result = result.strip()
+    if result.startswith("data: "):
+        result = result[6:]
     try:
-        response = _agentcore().invoke_agent_runtime(
-            agentRuntimeArn=RUNTIME_ARN,
-            runtimeSessionId=session_id,
-            runtimeUserId=actor_id,
-            payload=json.dumps(payload).encode("utf-8"),
-        )
+        decoded = json.loads(result)
+    except (json.JSONDecodeError, ValueError):
+        decoded = result
 
-        result = response.get("response", "")
-        if hasattr(result, "read"):
-            result = result.read()
-        if isinstance(result, bytes):
-            result = result.decode("utf-8")
+    if decoded is None or decoded == "":
+        raise RuntimeError("Agent returned an empty response")
+    elif isinstance(decoded, str):
+        result = decoded
+    else:
+        result = json.dumps(decoded)
 
-        # Parse SSE: strip "data: " and JSON-decode.
-        result = result.strip()
-        if result.startswith("data: "):
-            result = result[6:]
-        try:
-            decoded = json.loads(result)
-        except (json.JSONDecodeError, ValueError):
-            decoded = result
+    logger.info(
+        "AgentCore response length=%d, status=%s",
+        len(result), response.get("statusCode", ""),
+    )
 
-        if decoded is None or decoded == "":
-            logger.warning("AgentCore returned empty/null response")
-            result = "Sorry, I couldn't generate a response."
-        elif isinstance(decoded, str):
-            result = decoded
-        else:
-            result = json.dumps(decoded)
+    if user_message and result:
+        _save_history(session_id, user_message, result)
 
-        logger.info(
-            "AgentCore response length=%d, status=%s",
-            len(result), response.get("statusCode", ""),
-        )
-
-        if user_message and result:
-            _save_history(session_id, user_message, result)
-
-        return result
-    except Exception as exc:
-        logger.exception("AgentCore invocation failed")
-        return f"Sorry, I couldn't process your message right now. ({exc})"
+    return result
 
 
 # --------------------------------------------------------------------------

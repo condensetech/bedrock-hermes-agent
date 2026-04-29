@@ -212,6 +212,32 @@ To add/remove users from the allowlist later (any channel — telegram, slack, d
 ./scripts/allow_user.sh rm telegram 555111222
 ```
 
+### GitHub (org-level webhook)
+
+Hermes can respond to `@`-mentions in issue or pull-request comments across an entire GitHub org. Mentions trigger the agent in the PR/issue thread; the agent's reply is posted as a comment, and it can also act via its github MCP tools (read files, open PRs, etc.). When an issue or PR is closed, the agent's per-thread workspace and conversation history are wiped automatically.
+
+**Prerequisites**:
+- Phase 3 deployed (router stack with API Gateway).
+- `hermes/github-token` Secrets Manager entry — the **bot PAT** used at runtime. Same PAT used by the github recipe; only needs `repo` (or fine-grained read/write equivalents). **Does NOT need `admin:org_hook`** — webhook administration uses a separate admin credential (see below).
+- **Admin GitHub credentials** for the setup commands themselves — your `gh auth login` session, or a one-shot `--admin-token <pat>` (or `GITHUB_ADMIN_TOKEN` env). Whichever you use needs `admin:org_hook`. This credential never lands in AWS; only the bot PAT does.
+- Comment authors must be in the per-channel allowlist: `./scripts/allow_user.sh add github <github-login>`.
+
+**Setup**:
+
+```bash
+./scripts/setup_github_webhook.sh init <org>            # one-shot org-level webhook
+./scripts/setup_github_webhook.sh status <org>          # show registered webhook + opt-in list
+./scripts/setup_github_webhook.sh disable <org>         # tear down webhook + secret
+./scripts/setup_github_webhook.sh allow-public <owner>/<repo>   # opt a PUBLIC repo in
+./scripts/setup_github_webhook.sh deny-public <owner>/<repo>    # revoke
+```
+
+`init` is idempotent — re-running it updates the existing org webhook (e.g., to bump the events list or rotate the secret).
+
+**Public-repo gate** — closed by default. The agent has access to private observability (Sentry, internal repos) and we don't want it leaking via public comments. Public repos are opt-in per repo via `allow-public`.
+
+See [docs/GITHUB_SETUP.md](docs/GITHUB_SETUP.md) for trigger semantics, queueing/serialisation behavior, public-repo rationale, and troubleshooting.
+
 ### WeChat (Phase 4 — ECS Gateway)
 
 WeChat uses the **iLink Bot API** (`ilinkai.weixin.qq.com`) for personal WeChat accounts. It requires a persistent long-poll connection and is only available via the Phase 4 ECS gateway.
@@ -319,6 +345,7 @@ Key settings in `cdk.json`:
 | [INVOKE_GUIDE.md](docs/INVOKE_GUIDE.md) | All invocation methods (CLI, SDK, HTTP) |
 | [DISCORD_SETUP.md](docs/DISCORD_SETUP.md) | Discord bot configuration |
 | [FEISHU_SETUP.md](docs/FEISHU_SETUP.md) | Feishu (Lark) bot configuration |
+| [GITHUB_SETUP.md](docs/GITHUB_SETUP.md) | GitHub org-level webhook for @-mention triggers |
 | [AGENTCORE_CONTRACT.md](docs/AGENTCORE_CONTRACT.md) | HTTP contract protocol details |
 
 ## Reference

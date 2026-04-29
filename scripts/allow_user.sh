@@ -12,7 +12,7 @@
 #   ./scripts/allow_user.sh rm  <channel> <user_id>
 #   ./scripts/allow_user.sh list [<channel>]
 #
-# Channels: discord | telegram | slack | feishu | weixin
+# Channels: discord | telegram | slack | feishu | weixin | github
 #
 # Examples:
 #   ./scripts/allow_user.sh add discord 284102345871466496 198765432109876543
@@ -39,13 +39,13 @@ Usage:
   $0 rm   <channel> <user_id>                   Remove a user from the allowlist
   $0 list [<channel>]                           List allowlisted users
 
-Channels: discord | telegram | slack | feishu | weixin
+Channels: discord | telegram | slack | feishu | weixin | github
 EOF
 }
 
 valid_channel() {
     case "$1" in
-        discord|telegram|slack|feishu|weixin) return 0 ;;
+        discord|telegram|slack|feishu|weixin|github) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -58,6 +58,7 @@ validate_user_id() {
         telegram) [[ "$uid" =~ ^[0-9]{5,15}$ ]]  || warn "Telegram IDs are typically 5-15 digit numbers — got '$uid'" ;;
         slack)    [[ "$uid" =~ ^[UW][A-Z0-9]+$ ]] || warn "Slack IDs typically start with U or W — got '$uid'" ;;
         feishu|weixin) ;;  # Open formats — no shape check.
+        github)   [[ "$uid" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,38}[A-Za-z0-9])?$ ]] || warn "GitHub logins are 1-39 chars, alphanumeric+dash, can't start/end with dash — got '$uid'" ;;
     esac
 }
 

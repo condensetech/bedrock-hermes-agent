@@ -149,6 +149,25 @@ class HermesRouterStack(Stack):
             )
         )
 
+        # Allow Lambda to clean up github-session workspaces on PR/issue
+        # close. Scoped to the github: prefix so other channels' workspaces
+        # are out of reach.
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="ListGithubWorkspaces",
+                actions=["s3:ListBucket"],
+                resources=[f"arn:aws:s3:::{bucket_name}"],
+                conditions={"StringLike": {"s3:prefix": ["github:*"]}},
+            )
+        )
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                sid="DeleteGithubWorkspaceObjects",
+                actions=["s3:DeleteObject"],
+                resources=[f"arn:aws:s3:::{bucket_name}/github:*"],
+            )
+        )
+
         # ---- HTTP API Gateway --------------------------------------------
 
         integration = HttpLambdaIntegration("RouterIntegration", self.router_fn)
@@ -165,6 +184,7 @@ class HermesRouterStack(Stack):
             ("/webhook/slack", [apigwv2.HttpMethod.POST]),
             ("/webhook/discord", [apigwv2.HttpMethod.POST]),
             ("/webhook/feishu", [apigwv2.HttpMethod.POST]),
+            ("/webhook/github", [apigwv2.HttpMethod.POST]),
             ("/health", [apigwv2.HttpMethod.GET]),
         ]
         for path, methods in routes:
