@@ -15,13 +15,7 @@
       "codeLocation": "app/hermes/",
       "runtimeVersion": "PYTHON_3_13",
       "networkMode": "PUBLIC",
-      "protocol": "HTTP",
-      "envVars": [
-        {
-          "name": "BEDROCK_MODEL_ID",
-          "value": "eu.anthropic.claude-opus-4-7"
-        }
-      ]
+      "protocol": "HTTP"
     }
   ],
   "memories": [],

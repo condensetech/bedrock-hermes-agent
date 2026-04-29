@@ -111,21 +111,45 @@ TARGETS
     rsync -a --delete --exclude='__pycache__' --exclude='Dockerfile' \
         "$PROJECT_DIR/bridge/" "$PROJECT_DIR/app/hermes/bridge/"
 
-    # Sync runtime envVars from cdk.json → agentcore.json.
-    # cdk.json is the source of truth (per README); agentcore.json is generated.
-    info "Syncing envVars from cdk.json → agentcore.json …"
+    # Render agentcore/agentcore.json from agentcore/agentcore.json.template.
+    # The rendered file embeds per-deployment values (account ID, role ARN,
+    # bucket name) and is gitignored — only the template is tracked.
+    info "Rendering agentcore/agentcore.json from template …"
     MODEL_ID=$(jq -r '.context.default_model_id // empty' cdk.json)
     if [ -z "$MODEL_ID" ]; then
         error "cdk.json context.default_model_id is empty — cannot configure runtime."
         exit 1
     fi
+    BUCKET_NAME=$(aws cloudformation describe-stacks \
+        --stack-name "${PROJECT_NAME}-agentcore" \
+        --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" \
+        --output text 2>/dev/null || echo "")
+    EXECUTION_ROLE_ARN=$(aws cloudformation describe-stacks \
+        --stack-name "${PROJECT_NAME}-agentcore" \
+        --query "Stacks[0].Outputs[?OutputKey=='ExecutionRoleArn'].OutputValue" \
+        --output text 2>/dev/null || echo "")
+    if [ -z "$BUCKET_NAME" ] || [ "$BUCKET_NAME" = "None" ]; then
+        warn "Could not resolve workspace bucket from ${PROJECT_NAME}-agentcore — workspace persistence will be disabled."
+        BUCKET_NAME=""
+    fi
+    if [ -z "$EXECUTION_ROLE_ARN" ] || [ "$EXECUTION_ROLE_ARN" = "None" ]; then
+        warn "Could not resolve execution role from ${PROJECT_NAME}-agentcore — agentcore CLI will auto-create a (less-permissive) role."
+        EXECUTION_ROLE_ARN=""
+    fi
     info "  BEDROCK_MODEL_ID=$MODEL_ID"
-    TMP=$(mktemp)
-    jq --arg model "$MODEL_ID" '
-        .runtimes[0].envVars = [
-            { "name": "BEDROCK_MODEL_ID", "value": $model }
-        ]
-    ' agentcore/agentcore.json > "$TMP" && mv "$TMP" agentcore/agentcore.json
+    info "  S3_BUCKET=${BUCKET_NAME:-<unset>}"
+    info "  executionRoleArn=${EXECUTION_ROLE_ARN:-<auto>}"
+    if [ ! -f "$PROJECT_DIR/agentcore/agentcore.json.template" ]; then
+        error "Missing agentcore/agentcore.json.template — cannot render runtime config."
+        exit 1
+    fi
+    jq --arg model "$MODEL_ID" --arg bucket "$BUCKET_NAME" --arg role "$EXECUTION_ROLE_ARN" '
+        .runtimes[0].envVars = (
+            [{"name": "BEDROCK_MODEL_ID", "value": $model}]
+            + (if $bucket != "" then [{"name": "S3_BUCKET", "value": $bucket}] else [] end)
+        )
+        | (if $role != "" then .runtimes[0].executionRoleArn = $role else . end)
+    ' "$PROJECT_DIR/agentcore/agentcore.json.template" > "$PROJECT_DIR/agentcore/agentcore.json"
 
     # Build and deploy via agentcore CLI.
     info "Deploying to AgentCore …"

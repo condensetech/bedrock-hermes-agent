@@ -35,10 +35,14 @@ package-lock.json
 agentcore/.cli/
 agentcore/aws-targets.json
 agentcore/runtime.json
+agentcore/agentcore.json
 agentcore/cdk/node_modules/
 agentcore/cdk/package-lock.json
 agentcore/cdk/cdk.out/
 agentcore/cdk/dist/
+
+# Claude Code transient state
+.claude/scheduled_tasks.lock
 
 # Secrets (never commit)
 .env
