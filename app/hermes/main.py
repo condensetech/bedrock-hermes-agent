@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import traceback
 from typing import Any
 
@@ -73,6 +74,73 @@ app = BedrockAgentCoreApp()
 log = app.logger
 
 # ---------------------------------------------------------------------------
+# Workspace sync (S3-backed persistence, latched per session)
+# ---------------------------------------------------------------------------
+#
+# AgentCore runs one Firecracker microVM per session, so the session ID is
+# stable for the container's lifetime. We lazily restore the workspace from
+# S3 on the first invocation, start a background save thread, and flush on
+# SIGTERM. Disabled if S3_BUCKET is unset.
+
+_workspace_sync: Any = None
+_workspace_namespace: str | None = None
+_workspace_lock = threading.Lock()
+
+
+def _resolve_session_id(payload: dict, context: Any) -> str | None:
+    """Pull the session ID from the SDK context (with payload + env fallbacks)."""
+    for attr in ("session_id", "sessionId", "agentRuntimeSessionId", "runtime_session_id"):
+        val = getattr(context, attr, None)
+        if val:
+            return val
+    if isinstance(payload, dict):
+        for key in ("sessionId", "session_id"):
+            if payload.get(key):
+                return payload[key]
+    for var in (
+        "AGENT_RUNTIME_SESSION_ID",
+        "BEDROCK_AGENTCORE_SESSION_ID",
+        "AGENTCORE_SESSION_ID",
+    ):
+        val = os.environ.get(var)
+        if val:
+            return val
+    return None
+
+
+def _ensure_workspace(session_id: str | None) -> None:
+    """Lazy-init: on first call, restore from S3 and start the periodic save."""
+    global _workspace_sync, _workspace_namespace
+    if not session_id:
+        return
+    if not os.environ.get("S3_BUCKET"):
+        return  # Persistence disabled — bucket env var not set.
+
+    with _workspace_lock:
+        if _workspace_sync is not None:
+            if _workspace_namespace != session_id:
+                # Shouldn't happen with per-session microVMs, but guard anyway.
+                log.warning(
+                    "Container reused for a different session (was=%s now=%s) — "
+                    "keeping the original namespace",
+                    _workspace_namespace, session_id,
+                )
+            return
+
+        try:
+            from bridge.workspace_sync import WorkspaceSync  # noqa: WPS433
+
+            sync = WorkspaceSync()
+            sync.restore(session_id)
+            sync.start_periodic_save(session_id)
+            _workspace_sync = sync
+            _workspace_namespace = session_id
+            log.info("Workspace sync ready (namespace=%s)", session_id)
+        except Exception as exc:
+            log.warning("Workspace sync init failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Cached agent singleton
 # ---------------------------------------------------------------------------
 
@@ -124,6 +192,12 @@ def get_or_create_agent():
 
 def _sigterm_handler(signum: int, frame: Any) -> None:
     log.info("SIGTERM received — shutting down")
+    if _workspace_sync is not None and _workspace_namespace:
+        try:
+            log.info("Final workspace flush (namespace=%s) …", _workspace_namespace)
+            _workspace_sync.save(_workspace_namespace)
+        except Exception as exc:
+            log.warning("Final workspace save failed: %s", exc)
     sys.exit(0)
 
 
@@ -141,6 +215,10 @@ async def invoke(payload, context):
     if not message or not message.strip():
         yield ""
         return
+
+    # Restore + periodically persist this session's workspace (memories,
+    # skills, SQLite) to S3. Silent no-op if S3_BUCKET isn't configured.
+    _ensure_workspace(_resolve_session_id(payload, context))
 
     try:
         agent = get_or_create_agent()

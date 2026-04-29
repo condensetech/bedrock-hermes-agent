@@ -74,6 +74,7 @@ class HermesAgentCoreStack(Stack):
             role_name=f"{project}-execution-role",
             assumed_by=iam.CompositePrincipal(
                 iam.ServicePrincipal("bedrock.amazonaws.com"),
+                iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
                 iam.AccountPrincipal(account),
             ),
         )
@@ -134,6 +135,26 @@ class HermesAgentCoreStack(Stack):
                     "kms:GenerateDataKey",
                 ],
                 resources=[kms_key_arn],
+            )
+        )
+
+        # KMS — allow encryption/decryption of any S3-served object. The user-
+        # files bucket uses an auto-created CDK KMS key (separate from the
+        # project CMK above); rather than hard-wiring its ARN, scope the
+        # permission to S3 via kms:ViaService.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="KmsForS3",
+                actions=[
+                    "kms:Decrypt",
+                    "kms:GenerateDataKey",
+                ],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "kms:ViaService": f"s3.{region}.amazonaws.com",
+                    },
+                },
             )
         )
 
