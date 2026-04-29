@@ -192,23 +192,17 @@ See [docs/INVOKE_GUIDE.md](docs/INVOKE_GUIDE.md) for AWS CLI, JavaScript SDK, an
 
 ## Channel Integration
 
-### Discord
-
-1. Create Discord Application at [Developer Portal](https://discord.com/developers/applications)
-2. Set Interactions Endpoint URL to your API Gateway webhook endpoint
-3. Register `/ask` slash command
-4. Add users to DynamoDB allowlist
-
-See [docs/DISCORD_SETUP.md](docs/DISCORD_SETUP.md) for step-by-step instructions.
-
-### Telegram / Slack
+### Telegram / Slack / Discord
 
 Configure webhooks after Phase 3 deployment:
 
 ```bash
 ./scripts/setup_telegram.sh
 ./scripts/setup_slack.sh
+./scripts/setup_discord.sh
 ```
+
+The Discord script is interactive — it walks you through the manual steps in the Discord Developer Portal, validates inputs, stores secrets, registers the `/ask` slash command, and seeds the DynamoDB allowlist. See [docs/DISCORD_SETUP.md](docs/DISCORD_SETUP.md) for details and troubleshooting.
 
 ### WeChat (Phase 4 — ECS Gateway)
 

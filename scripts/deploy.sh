@@ -111,11 +111,27 @@ TARGETS
     rsync -a --delete --exclude='__pycache__' --exclude='Dockerfile' \
         "$PROJECT_DIR/bridge/" "$PROJECT_DIR/app/hermes/bridge/"
 
+    # Sync runtime envVars from cdk.json → agentcore.json.
+    # cdk.json is the source of truth (per README); agentcore.json is generated.
+    info "Syncing envVars from cdk.json → agentcore.json …"
+    MODEL_ID=$(jq -r '.context.default_model_id // empty' cdk.json)
+    if [ -z "$MODEL_ID" ]; then
+        error "cdk.json context.default_model_id is empty — cannot configure runtime."
+        exit 1
+    fi
+    info "  BEDROCK_MODEL_ID=$MODEL_ID"
+    TMP=$(mktemp)
+    jq --arg model "$MODEL_ID" '
+        .runtimes[0].envVars = [
+            { "name": "BEDROCK_MODEL_ID", "value": $model }
+        ]
+    ' agentcore/agentcore.json > "$TMP" && mv "$TMP" agentcore/agentcore.json
+
     # Build and deploy via agentcore CLI.
     info "Deploying to AgentCore …"
     agentcore deploy --yes --verbose
 
-    # Extract runtime IDs and write back to cdk.json.
+    # Extract runtime IDs and persist to agentcore/runtime.json (gitignored).
     info "Extracting runtime IDs …"
     # Strip ANSI escape sequences (agentcore CLI may emit cursor control codes).
     STATUS_JSON=$(agentcore status --json 2>/dev/null | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' || echo "{}")
@@ -139,16 +155,17 @@ TARGETS
         info "Runtime ARN:  $RUNTIME_ARN"
         info "Qualifier:    $QUALIFIER"
 
-        # Update cdk.json with runtime IDs.
-        TMP=$(mktemp)
-        jq ".context.agentcore_runtime_arn = \"$RUNTIME_ARN\" | \
-            .context.agentcore_qualifier = \"$QUALIFIER\"" \
-            cdk.json > "$TMP" && mv "$TMP" cdk.json
+        # Write runtime IDs to a gitignored state file (per-deployment values
+        # — account ID and runtime ID embedded in the ARN must not be checked
+        # in). app.py reads this at synth time.
+        jq -n --arg arn "$RUNTIME_ARN" --arg qual "$QUALIFIER" \
+            '{runtime_arn: $arn, qualifier: $qual}' \
+            > "$PROJECT_DIR/agentcore/runtime.json"
 
-        info "cdk.json updated with runtime IDs."
+        info "agentcore/runtime.json updated with runtime IDs."
     else
         warn "Could not extract runtime IDs automatically."
-        warn "Run 'agentcore status --json' and set agentcore_runtime_arn / agentcore_qualifier in cdk.json manually."
+        warn "Run 'agentcore status --json' and write {runtime_arn, qualifier} to agentcore/runtime.json manually."
     fi
 
     info "Phase 2 complete."
@@ -161,10 +178,24 @@ phase3() {
     info "=== Phase 3: CDK Dependent Stacks ==="
 
     # Verify runtime IDs are set.
-    RUNTIME_ARN=$(jq -r '.context.agentcore_runtime_arn // empty' cdk.json)
+    RUNTIME_ARN=$(jq -r '.runtime_arn // empty' "$PROJECT_DIR/agentcore/runtime.json" 2>/dev/null || echo "")
     if [ -z "$RUNTIME_ARN" ]; then
-        warn "agentcore_runtime_arn not set in cdk.json — Lambda will not be able to invoke AgentCore."
-        warn "Run Phase 2 first, or set the values manually."
+        warn "runtime_arn not set in agentcore/runtime.json — Lambda will not be able to invoke AgentCore."
+        warn "Run Phase 2 first, or write the values manually."
+    fi
+
+    # Vendor router Lambda native deps. PyNaCl is needed for Discord Ed25519
+    # signature verification; the wheels are gitignored, so they have to be
+    # installed into the Lambda asset directory before `cdk deploy` packages it.
+    # Forced to manylinux2014_x86_64 / cp313 to match the Lambda runtime.
+    if [ ! -d "$PROJECT_DIR/lambda/router/nacl" ]; then
+        info "Installing router Lambda vendored deps (pynacl) …"
+        pip install --quiet \
+            --target "$PROJECT_DIR/lambda/router/" \
+            --platform manylinux2014_x86_64 \
+            --python-version 3.13 \
+            --only-binary=:all: \
+            pynacl
     fi
 
     $CDK deploy \
@@ -197,9 +228,9 @@ phase4() {
     info "=== Phase 4: ECS Gateway (WeChat + Feishu) ==="
 
     # Verify runtime ARN is set.
-    RUNTIME_ARN=$(jq -r '.context.agentcore_runtime_arn // empty' cdk.json)
+    RUNTIME_ARN=$(jq -r '.runtime_arn // empty' "$PROJECT_DIR/agentcore/runtime.json" 2>/dev/null || echo "")
     if [ -z "$RUNTIME_ARN" ]; then
-        error "agentcore_runtime_arn not set in cdk.json. Run Phase 2 first."
+        error "runtime_arn not set in agentcore/runtime.json. Run Phase 2 first."
         exit 1
     fi
 

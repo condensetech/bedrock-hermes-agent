@@ -10,6 +10,9 @@ Phase 2 (``agentcore deploy``) runs outside CDK.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import aws_cdk as cdk
 
 from stacks.vpc_stack import HermesVpcStack
@@ -26,9 +29,24 @@ app = cdk.App()
 
 project = app.node.try_get_context("project_name") or "hermes-agentcore"
 
-# Optional: read AgentCore runtime IDs injected by Phase 2.
-agentcore_runtime_arn = app.node.try_get_context("agentcore_runtime_arn") or ""
-agentcore_qualifier = app.node.try_get_context("agentcore_qualifier") or ""
+# Read AgentCore runtime IDs from the gitignored local state file written
+# by `scripts/deploy.sh phase2`. cdk.json context is used as a fallback so
+# direct `cdk deploy` calls still work if someone exports the values that way.
+_runtime_state_path = Path(__file__).parent / "agentcore" / "runtime.json"
+_runtime_state: dict = {}
+if _runtime_state_path.exists():
+    _runtime_state = json.loads(_runtime_state_path.read_text())
+
+agentcore_runtime_arn = (
+    _runtime_state.get("runtime_arn")
+    or app.node.try_get_context("agentcore_runtime_arn")
+    or ""
+)
+agentcore_qualifier = (
+    _runtime_state.get("qualifier")
+    or app.node.try_get_context("agentcore_qualifier")
+    or ""
+)
 alarm_email = app.node.try_get_context("alarm_email") or ""
 
 # --------------------------------------------------------------------------
