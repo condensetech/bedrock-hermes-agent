@@ -44,7 +44,9 @@ class HermesCronStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_13,
             handler="index.handler",
             code=lambda_.Code.from_asset("lambda/cron"),
-            timeout=Duration.minutes(5),
+            # 10 min: multi-step agent runs can take longer than the
+            # original 5 min when many MCP tools are loaded.
+            timeout=Duration.minutes(10),
             memory_size=256,
             environment={
                 "AGENTCORE_RUNTIME_ARN": agentcore_runtime_arn,

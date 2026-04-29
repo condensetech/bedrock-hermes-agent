@@ -21,6 +21,7 @@ import urllib.request
 from typing import Any
 
 import boto3
+from botocore.config import Config
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -34,7 +35,17 @@ _agentcore_client: Any = None
 def _agentcore() -> Any:
     global _agentcore_client
     if _agentcore_client is None:
-        _agentcore_client = boto3.client("bedrock-agentcore")
+        # Multi-step agent runs can exceed boto3's default 60s read timeout.
+        # Stay below the Lambda function timeout so we error cleanly instead
+        # of being killed by the runtime mid-call.
+        _agentcore_client = boto3.client(
+            "bedrock-agentcore",
+            config=Config(
+                read_timeout=590,
+                connect_timeout=10,
+                retries={"max_attempts": 0},
+            ),
+        )
     return _agentcore_client
 
 

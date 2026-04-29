@@ -23,6 +23,7 @@ import urllib.request
 from typing import Any
 
 import boto3
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
@@ -49,7 +50,19 @@ _agentcore_client: Any = None
 def _agentcore() -> Any:
     global _agentcore_client
     if _agentcore_client is None:
-        _agentcore_client = boto3.client("bedrock-agentcore")
+        # Multi-step agent runs (Sentry + GitHub correlation, etc.) routinely
+        # exceed boto3's default 60s read timeout. Set generous values that
+        # stay below the Lambda function timeout so the error handler runs
+        # cleanly instead of the runtime being killed mid-call. We do our
+        # own retries via the discord async-followup path; disable boto's.
+        _agentcore_client = boto3.client(
+            "bedrock-agentcore",
+            config=Config(
+                read_timeout=590,
+                connect_timeout=10,
+                retries={"max_attempts": 0},
+            ),
+        )
     return _agentcore_client
 
 

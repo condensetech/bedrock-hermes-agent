@@ -77,7 +77,10 @@ class HermesRouterStack(Stack):
             runtime=lambda_.Runtime.PYTHON_3_13,
             handler="index.handler",
             code=lambda_.Code.from_asset("lambda/router"),
-            timeout=Duration.seconds(120),
+            # 10 min: multi-step agent calls (Sentry+GitHub correlation,
+            # subagent delegation) routinely exceed the original 120 s.
+            # Discord deferred-response window is 15 min, so 10 min is safe.
+            timeout=Duration.seconds(600),
             memory_size=256,
             environment={
                 "AGENTCORE_RUNTIME_ARN": agentcore_runtime_arn,
