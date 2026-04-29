@@ -1,7 +1,31 @@
 """Router Lambda — channel webhooks → AgentCore invocation.
 
-Handles incoming messages from Telegram, Slack, and Discord, resolves user
-identity via DynamoDB, and dispatches to the AgentCore runtime.
+Handles incoming messages from Telegram, Slack, Discord, and Feishu.
+Resolves user identity via DynamoDB, dispatches the agent call to AgentCore,
+and posts the response back via the relevant channel API.
+
+Concurrency model
+=================
+AgentCore serialises requests sharing the same ``runtimeSessionId`` (per-
+session microVM model). Two messages from the same user in the same
+channel land in the same session, so the second call is queued behind the
+first and routinely blows the boto3 read timeout.
+
+We keep the per-session sequential constraint (it preserves the agent's
+workspace/SQLite consistency) and instead add a lock + queue layered
+on top of the existing identity_table:
+
+    PK = "INFLIGHT#<actor_id>"   SK = "LOCK"   ttl=900s
+        Lock record. Held by the lambda invocation actively processing.
+
+    PK = "QUEUE#<actor_id>"      SK = "<ts_ms>"   ttl=900s
+        Pending messages, ordered by enqueue time.
+
+Every webhook handler enqueues, then tries to acquire the lock:
+  - acquired: dequeue + async-invoke ``_followup`` for this turn.
+  - contended: async-invoke ``_queued_notice`` (sends "Hold on…" via the
+    channel API). When the in-flight ``_followup`` finishes it dequeues
+    the next item itself, retaining the lock until the queue is empty.
 
 Environment variables (set by CDK):
     AGENTCORE_RUNTIME_ARN  — AgentCore runtime ARN
@@ -20,7 +44,8 @@ import os
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+import uuid
+from typing import Any, Optional
 
 import boto3
 from botocore.config import Config
@@ -43,6 +68,17 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "")
 HISTORY_MAX_TURNS = int(os.environ.get("HISTORY_MAX_TURNS", "20"))
 HISTORY_TTL_DAYS = int(os.environ.get("HISTORY_TTL_DAYS", "7"))
 
+# Lock + queue TTLs. 15 min matches Discord's interaction-token window —
+# anything older than that is unrecoverable on Discord anyway, and the
+# other channels don't care.
+LOCK_TTL_SECONDS = 900
+QUEUE_TTL_SECONDS = 900
+
+QUEUED_MESSAGE = (
+    "⏳ Hold on, I'm still working on your previous request — "
+    "I'll reply as soon as I'm done."
+)
+
 # Lazy-init the agentcore client (might not be available in test).
 _agentcore_client: Any = None
 
@@ -51,10 +87,9 @@ def _agentcore() -> Any:
     global _agentcore_client
     if _agentcore_client is None:
         # Multi-step agent runs (Sentry + GitHub correlation, etc.) routinely
-        # exceed boto3's default 60s read timeout. Set generous values that
-        # stay below the Lambda function timeout so the error handler runs
-        # cleanly instead of the runtime being killed mid-call. We do our
-        # own retries via the discord async-followup path; disable boto's.
+        # exceed boto3's default 60s read timeout. Stay below the Lambda
+        # function timeout so the error handler runs cleanly instead of the
+        # runtime being killed mid-call.
         _agentcore_client = boto3.client(
             "bedrock-agentcore",
             config=Config(
@@ -71,18 +106,18 @@ def _agentcore() -> Any:
 # --------------------------------------------------------------------------
 
 def handler(event: dict, context: Any) -> dict:
-    """API Gateway HTTP API v2 handler."""
+    """API Gateway HTTP API v2 handler — also handles async self-invocations."""
+    # Async-invoked paths come in BEFORE we look at rawPath/method.
+    if event.get("_followup"):
+        return _process_followup(event["_followup"])
+    if event.get("_queued_notice"):
+        return _process_queued_notice(event["_queued_notice"])
+
     path = event.get("rawPath", "")
     method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
-
     logger.info("Incoming request: %s %s", method, path)
 
     try:
-        # Discord async followup (invoked by ourselves).
-        if event.get("_discord_followup"):
-            _discord_followup(event["_discord_followup"])
-            return _ok({"status": "ok"})
-
         if path.startswith("/webhook/telegram"):
             return _handle_telegram(event)
         elif path.startswith("/webhook/slack"):
@@ -101,13 +136,262 @@ def handler(event: dict, context: Any) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Lock + queue (DynamoDB on identity_table)
+# --------------------------------------------------------------------------
+
+def _try_acquire_lock(actor_id: str, owner_id: str) -> bool:
+    """Acquire the per-actor processing lock. Returns True on success.
+
+    Uses a conditional put: succeeds only if the lock is absent or the
+    existing TTL has expired (covers crashed lambdas that never released).
+    """
+    now = int(time.time())
+    try:
+        identity_table.put_item(
+            Item={
+                "PK": f"INFLIGHT#{actor_id}",
+                "SK": "LOCK",
+                "owner": owner_id,
+                "acquiredAt": now,
+                "ttl": now + LOCK_TTL_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(PK) OR #ttl < :now",
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={":now": now},
+        )
+        return True
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code == "ConditionalCheckFailedException":
+            return False
+        logger.exception("Lock acquire failed for %s", actor_id)
+        return False
+
+
+def _release_lock(actor_id: str, owner_id: str) -> None:
+    """Release the lock if we still own it. Idempotent."""
+    try:
+        identity_table.delete_item(
+            Key={"PK": f"INFLIGHT#{actor_id}", "SK": "LOCK"},
+            ConditionExpression="#owner = :owner",
+            ExpressionAttributeNames={"#owner": "owner"},
+            ExpressionAttributeValues={":owner": owner_id},
+        )
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code != "ConditionalCheckFailedException":
+            logger.warning("Lock release failed for %s: %s", actor_id, exc)
+
+
+def _enqueue(actor_id: str, item: dict) -> None:
+    """Append an item to the actor's pending queue."""
+    now = int(time.time())
+    sk = f"{int(time.time() * 1000):015d}_{uuid.uuid4().hex[:8]}"
+    identity_table.put_item(Item={
+        "PK": f"QUEUE#{actor_id}",
+        "SK": sk,
+        "item": json.dumps(item),
+        "ttl": now + QUEUE_TTL_SECONDS,
+    })
+
+
+def _dequeue(actor_id: str) -> Optional[dict]:
+    """Atomically remove + return the oldest item, or None if empty."""
+    from boto3.dynamodb.conditions import Key
+
+    try:
+        resp = identity_table.query(
+            KeyConditionExpression=Key("PK").eq(f"QUEUE#{actor_id}"),
+            ScanIndexForward=True,  # oldest first
+            Limit=1,
+        )
+    except ClientError as exc:
+        logger.warning("Queue read failed for %s: %s", actor_id, exc)
+        return None
+
+    items = resp.get("Items", [])
+    if not items:
+        return None
+    head = items[0]
+
+    # Conditional delete so concurrent dequeues from the same key don't
+    # double-process the same item.
+    try:
+        identity_table.delete_item(
+            Key={"PK": head["PK"], "SK": head["SK"]},
+            ConditionExpression="attribute_exists(PK)",
+        )
+    except ClientError:
+        return None  # someone else got it
+
+    try:
+        return json.loads(head["item"])
+    except (json.JSONDecodeError, TypeError):
+        logger.error("Corrupt queue item for %s: %r", actor_id, head)
+        return None
+
+
+# --------------------------------------------------------------------------
+# Async dispatch (lambda → lambda via Event invocation)
+# --------------------------------------------------------------------------
+
+_lambda_client: Any = None
+
+
+def _async_invoke(payload: dict) -> None:
+    """Self-invoke this lambda asynchronously (InvocationType=Event)."""
+    global _lambda_client
+    if _lambda_client is None:
+        _lambda_client = boto3.client("lambda")
+    _lambda_client.invoke(
+        FunctionName=os.environ.get("AWS_LAMBDA_FUNCTION_NAME", ""),
+        InvocationType="Event",
+        Payload=json.dumps(payload).encode(),
+    )
+
+
+def _dispatch_or_queue(
+    *,
+    actor_id: str,
+    channel: str,
+    agent_payload: dict,
+    delivery: dict,
+) -> None:
+    """Common entry point used by every webhook handler.
+
+    Always enqueues the work item, then tries to acquire the lock.
+      - Acquired → dequeue (likely picking up our own item) and async-invoke
+        ``_followup`` to process it.
+      - Contended → async-invoke ``_queued_notice`` so the user sees a
+        prompt acknowledgement; the in-flight followup will pick up the
+        item when it finishes its current turn.
+    """
+    item = {
+        "channel": channel,
+        "actor_id": actor_id,
+        "agent_payload": agent_payload,
+        "delivery": delivery,
+    }
+    _enqueue(actor_id, item)
+
+    owner_id = uuid.uuid4().hex
+    if _try_acquire_lock(actor_id, owner_id):
+        next_item = _dequeue(actor_id)
+        if next_item is None:
+            # Race: someone else just dequeued. Release and let them run.
+            _release_lock(actor_id, owner_id)
+            return
+        next_item["owner_id"] = owner_id
+        _async_invoke({"_followup": next_item})
+    else:
+        _async_invoke({"_queued_notice": {
+            "channel": channel,
+            "delivery": delivery,
+        }})
+
+
+# --------------------------------------------------------------------------
+# Followup processor (the unified async worker)
+# --------------------------------------------------------------------------
+
+def _process_followup(ctx: dict) -> dict:
+    """Run one turn end-to-end: agent invocation + channel response, then
+    drain the queue (retaining the lock) or release it if empty."""
+    channel = ctx["channel"]
+    actor_id = ctx["actor_id"]
+    owner_id = ctx["owner_id"]
+    agent_payload = ctx["agent_payload"]
+    delivery = ctx["delivery"]
+
+    user_id = agent_payload.get("userId", "")
+    session_id = _build_session_id(user_id, channel)
+
+    logger.info(
+        "Followup: channel=%s actor=%s msg=%r",
+        channel, actor_id, (agent_payload.get("message") or "")[:50],
+    )
+
+    try:
+        agent_response = _invoke_agentcore(session_id, actor_id, agent_payload)
+        _deliver_response(channel, delivery, agent_response)
+    except Exception:
+        logger.exception("Followup processing failed")
+        # Best-effort error delivery so the user isn't left hanging.
+        try:
+            _deliver_response(
+                channel, delivery,
+                "Sorry, I couldn't process your message right now.",
+            )
+        except Exception:
+            logger.exception("Error-delivery also failed")
+
+    # Drain queue, hand off lock if more work; release otherwise.
+    next_item = _dequeue(actor_id)
+    if next_item is not None:
+        next_item["owner_id"] = owner_id
+        _async_invoke({"_followup": next_item})
+        return _ok({"status": "handed_off"})
+
+    _release_lock(actor_id, owner_id)
+
+    # Race-safety: an enqueue may have happened between our dequeue and
+    # release. The webhook would have sent a "queued notice" expecting us
+    # to pick it up — and we're about to exit. Re-check; if so, re-acquire
+    # and process. Window is tiny; this is the belt-and-braces.
+    leftover = _dequeue(actor_id)
+    if leftover is None:
+        return _ok({"status": "ok"})
+
+    new_owner = uuid.uuid4().hex
+    if _try_acquire_lock(actor_id, new_owner):
+        leftover["owner_id"] = new_owner
+        _async_invoke({"_followup": leftover})
+    else:
+        # Someone else won the race for the lock — re-enqueue so we don't
+        # lose the message; they'll dequeue it.
+        _enqueue(actor_id, leftover)
+    return _ok({"status": "ok"})
+
+
+def _process_queued_notice(ctx: dict) -> dict:
+    """Send the per-channel 'Queued — will reply soon' message."""
+    try:
+        _deliver_response(ctx["channel"], ctx["delivery"], QUEUED_MESSAGE)
+    except Exception:
+        logger.exception("Queued-notice delivery failed")
+    return _ok({"status": "ok"})
+
+
+def _deliver_response(channel: str, delivery: dict, text: str) -> None:
+    """Channel-agnostic dispatch to the correct send-message function."""
+    if channel == "discord":
+        _patch_discord(
+            app_id=delivery["app_id"],
+            interaction_token=delivery["interaction_token"],
+            text=text,
+        )
+    elif channel == "telegram":
+        _send_telegram_message(delivery["chat_id"], text)
+    elif channel == "slack":
+        _send_slack_message(
+            delivery["channel_id"], text,
+            thread_ts=delivery.get("thread_ts"),
+        )
+    elif channel == "feishu":
+        _send_feishu_message(
+            delivery["chat_id"], delivery.get("message_id", ""), text,
+        )
+    else:
+        logger.error("Unknown channel for delivery: %s", channel)
+
+
+# --------------------------------------------------------------------------
 # Telegram
 # --------------------------------------------------------------------------
 
 def _handle_telegram(event: dict) -> dict:
     body = _parse_body(event)
 
-    # Telegram sends different update types.
     message = body.get("message") or body.get("edited_message")
     if not message:
         return _ok({"status": "ignored"})
@@ -121,20 +405,14 @@ def _handle_telegram(event: dict) -> dict:
     if not text.strip():
         return _ok({"status": "empty"})
 
-    # Check allowlist.
     if not _is_allowed(actor_id):
         logger.info("Blocked message from %s (not in allowlist)", actor_id)
         return _ok({"status": "blocked"})
 
-    # Resolve hermes user.
     hermes_user_id = _resolve_user(actor_id, username=username)
-    session_id = _build_session_id(hermes_user_id, "telegram")
-
-    # Handle images (photo attachments).
     images = _download_telegram_photos(message)
 
-    # Invoke AgentCore.
-    payload = {
+    agent_payload = {
         "action": "chat",
         "userId": hermes_user_id,
         "actorId": actor_id,
@@ -143,12 +421,12 @@ def _handle_telegram(event: dict) -> dict:
         "message": text,
         "images": images,
     }
+    delivery = {"chat_id": chat_id}
 
-    agent_response = _invoke_agentcore(session_id, actor_id, payload)
-
-    # Send response back to Telegram.
-    _send_telegram_message(chat_id, agent_response)
-
+    _dispatch_or_queue(
+        actor_id=actor_id, channel="telegram",
+        agent_payload=agent_payload, delivery=delivery,
+    )
     return _ok({"status": "ok"})
 
 
@@ -158,7 +436,6 @@ def _download_telegram_photos(message: dict) -> list[dict]:
     if not photos:
         return []
 
-    # Telegram sends multiple sizes — take the largest.
     photo = photos[-1]
     file_id = photo.get("file_id", "")
     if not file_id:
@@ -166,23 +443,23 @@ def _download_telegram_photos(message: dict) -> list[dict]:
 
     try:
         token = _get_secret("telegram-bot-token")
-        # Get file path from Telegram.
         url = f"https://api.telegram.org/bot{token}/getFile?file_id={file_id}"
         resp = json.loads(urllib.request.urlopen(url, timeout=10).read())
         file_path = resp.get("result", {}).get("file_path", "")
         if not file_path:
             return []
 
-        # Download file.
         download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
         file_data = urllib.request.urlopen(download_url, timeout=30).read()
 
-        # Upload to S3.
         ext = file_path.rsplit(".", 1)[-1] if "." in file_path else "jpg"
         s3_key = f"uploads/{int(time.time())}_{file_id}.{ext}"
         s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=file_data)
 
-        content_type = f"image/{ext}" if ext in ("jpg", "jpeg", "png", "gif", "webp") else "application/octet-stream"
+        content_type = (
+            f"image/{ext}" if ext in ("jpg", "jpeg", "png", "gif", "webp")
+            else "application/octet-stream"
+        )
         return [{"s3Key": s3_key, "contentType": content_type}]
     except Exception as exc:
         logger.warning("Failed to download Telegram photo: %s", exc)
@@ -196,7 +473,6 @@ def _send_telegram_message(chat_id: str, text: str) -> None:
     token = _get_secret("telegram-bot-token")
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    # Telegram has a 4096-character limit — split if needed.
     chunks = _split_message(text, max_len=4096)
     for chunk in chunks:
         data = json.dumps({
@@ -229,16 +505,13 @@ def _send_telegram_message(chat_id: str, text: str) -> None:
 def _handle_slack(event: dict) -> dict:
     body = _parse_body(event)
 
-    # Slack URL verification challenge.
     if body.get("type") == "url_verification":
         return _ok({"challenge": body.get("challenge", "")})
 
-    # Verify Slack request signature.
     signing_secret = _get_secret("slack-signing-secret")
     if not _verify_slack_signature(event, signing_secret):
         return _ok({"error": "Invalid signature"}, status=401)
 
-    # Parse Slack event.
     slack_event = body.get("event", {})
     if slack_event.get("type") != "message" or slack_event.get("subtype"):
         return _ok({"status": "ignored"})
@@ -246,15 +519,15 @@ def _handle_slack(event: dict) -> dict:
     text = slack_event.get("text", "")
     channel_id = slack_event.get("channel", "")
     user_id = slack_event.get("user", "")
+    thread_ts = slack_event.get("ts")
     actor_id = f"slack:{user_id}"
 
     if not text.strip() or not _is_allowed(actor_id):
         return _ok({"status": "blocked"})
 
     hermes_user_id = _resolve_user(actor_id)
-    session_id = _build_session_id(hermes_user_id, "slack")
 
-    payload = {
+    agent_payload = {
         "action": "chat",
         "userId": hermes_user_id,
         "actorId": actor_id,
@@ -262,12 +535,12 @@ def _handle_slack(event: dict) -> dict:
         "chatId": channel_id,
         "message": text,
     }
+    delivery = {"channel_id": channel_id, "thread_ts": thread_ts}
 
-    agent_response = _invoke_agentcore(session_id, actor_id, payload)
-
-    # Send response back to Slack.
-    _send_slack_message(channel_id, agent_response, slack_event.get("ts"))
-
+    _dispatch_or_queue(
+        actor_id=actor_id, channel="slack",
+        agent_payload=agent_payload, delivery=delivery,
+    )
     return _ok({"status": "ok"})
 
 
@@ -280,8 +553,6 @@ def _verify_slack_signature(event: dict, signing_secret: str) -> bool:
 
     if not timestamp or not signature:
         return False
-
-    # Reject requests older than 5 minutes.
     if abs(time.time() - int(timestamp)) > 300:
         return False
 
@@ -292,16 +563,15 @@ def _verify_slack_signature(event: dict, signing_secret: str) -> bool:
     return hmac.compare_digest(computed, signature)
 
 
-def _send_slack_message(channel: str, text: str, thread_ts: str | None = None) -> None:
+def _send_slack_message(
+    channel: str, text: str, thread_ts: Optional[str] = None,
+) -> None:
     """Post a message to Slack via chat.postMessage."""
     if not text:
         return
     token = _get_secret("slack-bot-token")
     url = "https://slack.com/api/chat.postMessage"
-    payload: dict[str, Any] = {
-        "channel": channel,
-        "text": text,
-    }
+    payload: dict[str, Any] = {"channel": channel, "text": text}
     if thread_ts:
         payload["thread_ts"] = thread_ts
 
@@ -330,7 +600,6 @@ def _verify_discord_signature(event: dict, public_key_hex: str) -> bool:
     timestamp = headers.get("x-signature-timestamp", "")
     raw_body = event.get("body", "")
 
-    # API Gateway HTTP API v2 may base64-encode the body.
     if event.get("isBase64Encoded") and raw_body:
         import base64
         raw_body = base64.b64decode(raw_body).decode("utf-8")
@@ -352,7 +621,6 @@ def _verify_discord_signature(event: dict, public_key_hex: str) -> bool:
 
 
 def _handle_discord(event: dict) -> dict:
-    # Verify Ed25519 signature (required by Discord).
     public_key = _get_secret("discord-public-key")
     if not _verify_discord_signature(event, public_key):
         logger.warning("Discord signature verification failed")
@@ -364,11 +632,9 @@ def _handle_discord(event: dict) -> dict:
     if body.get("type") == 1:
         return _ok({"type": 1})
 
-    # Only handle message-type interactions.
     if body.get("type") not in (2, 4):  # APPLICATION_COMMAND or AUTO_COMPLETE
         return _ok({"status": "ignored"})
 
-    # For now, handle messages from the data payload.
     data = body.get("data", {})
     options = data.get("options", [])
     text = ""
@@ -376,7 +642,6 @@ def _handle_discord(event: dict) -> dict:
         if opt.get("name") == "message":
             text = opt.get("value", "")
             break
-
     if not text:
         text = data.get("content", body.get("content", ""))
 
@@ -388,43 +653,12 @@ def _handle_discord(event: dict) -> dict:
     if not text.strip() or not _is_allowed(actor_id):
         return _ok({"type": 4, "data": {"content": "Access denied."}})
 
-    # Get interaction token for deferred followup.
     interaction_token = body.get("token", "")
     app_id = body.get("application_id", "")
 
-    # Async-invoke ourselves to process in the background.
-    followup_payload = {
-        "_discord_followup": {
-            "app_id": app_id,
-            "interaction_token": interaction_token,
-            "actor_id": actor_id,
-            "channel_id": channel_id,
-            "text": text,
-        }
-    }
-    lambda_client = boto3.client("lambda")
-    lambda_client.invoke(
-        FunctionName=os.environ.get("AWS_LAMBDA_FUNCTION_NAME", ""),
-        InvocationType="Event",  # Async
-        Payload=json.dumps(followup_payload).encode(),
-    )
-
-    # Return deferred response immediately (shows "thinking..." in Discord).
-    return _ok({"type": 5})
-
-
-def _discord_followup(ctx: dict) -> None:
-    """Process Discord interaction asynchronously and edit the deferred response."""
-    app_id = ctx["app_id"]
-    token = ctx["interaction_token"]
-    actor_id = ctx["actor_id"]
-    channel_id = ctx["channel_id"]
-    text = ctx["text"]
-
     hermes_user_id = _resolve_user(actor_id)
-    session_id = _build_session_id(hermes_user_id, "discord")
 
-    payload = {
+    agent_payload = {
         "action": "chat",
         "userId": hermes_user_id,
         "actorId": actor_id,
@@ -432,15 +666,32 @@ def _discord_followup(ctx: dict) -> None:
         "chatId": channel_id,
         "message": text,
     }
+    delivery = {
+        "app_id": app_id,
+        "interaction_token": interaction_token,
+        "channel_id": channel_id,
+    }
 
-    logger.info("Discord followup: app_id=%s, actor=%s, text=%s", app_id, actor_id, text[:50])
+    _dispatch_or_queue(
+        actor_id=actor_id, channel="discord",
+        agent_payload=agent_payload, delivery=delivery,
+    )
 
-    agent_response = _invoke_agentcore(session_id, actor_id, payload)
-    logger.info("Discord followup: agent response length=%d", len(agent_response))
+    # Return the deferred response immediately. The deferred message will be
+    # PATCHed later — first by the queued-notice (if contended) and then by
+    # the followup with the real answer.
+    return _ok({"type": 5})
 
-    # Edit the original deferred response via Discord webhook.
-    url = f"https://discord.com/api/v10/webhooks/{app_id}/{token}/messages/@original"
-    content = agent_response[:2000] if agent_response.strip() else "No response from agent."
+
+def _patch_discord(*, app_id: str, interaction_token: str, text: str) -> None:
+    """Edit the deferred interaction response with *text*."""
+    if not interaction_token:
+        return
+    url = (
+        f"https://discord.com/api/v10/webhooks/{app_id}/"
+        f"{interaction_token}/messages/@original"
+    )
+    content = text[:2000] if (text and text.strip()) else "No response from agent."
     data = json.dumps({"content": content}).encode()
     req = urllib.request.Request(
         url, data=data, method="PATCH",
@@ -451,12 +702,12 @@ def _discord_followup(ctx: dict) -> None:
     )
     try:
         resp = urllib.request.urlopen(req, timeout=30)
-        logger.info("Discord followup: edit success, status=%d", resp.status)
+        logger.info("Discord PATCH success, status=%d", resp.status)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        logger.error("Discord followup edit failed: %s %s — %s", exc.code, exc.reason, body)
+        body_text = exc.read().decode("utf-8", errors="replace")
+        logger.error("Discord PATCH failed: %s %s — %s", exc.code, exc.reason, body_text)
     except Exception as exc:
-        logger.error("Discord followup edit failed: %s", exc)
+        logger.error("Discord PATCH failed: %s", exc)
 
 
 # --------------------------------------------------------------------------
@@ -467,16 +718,13 @@ def _handle_feishu(event: dict) -> dict:
     body = _parse_body(event)
     logger.info("Feishu body: %s", json.dumps(body, ensure_ascii=False)[:2000])
 
-    # Feishu URL verification challenge.
     if body.get("type") == "url_verification":
         return _ok({"challenge": body.get("challenge", "")})
 
-    # Parse event (Feishu 2.0 event format).
     header = body.get("header", {})
     event_type = header.get("event_type", "")
     feishu_event = body.get("event", {})
 
-    # Only handle im.message.receive_v1 events.
     if event_type != "im.message.receive_v1":
         return _ok({"status": "ignored"})
 
@@ -485,8 +733,8 @@ def _handle_feishu(event: dict) -> dict:
     message = feishu_event.get("message", {})
     chat_id = message.get("chat_id", "")
     msg_type = message.get("message_type", "")
+    message_id = message.get("message_id", "")
 
-    # Only handle text messages for now.
     if msg_type != "text":
         return _ok({"status": "ignored"})
 
@@ -497,14 +745,12 @@ def _handle_feishu(event: dict) -> dict:
         text = ""
 
     actor_id = f"feishu:{user_id}"
-
     if not text.strip() or not _is_allowed(actor_id):
         return _ok({"status": "blocked"})
 
     hermes_user_id = _resolve_user(actor_id)
-    session_id = _build_session_id(hermes_user_id, "feishu")
 
-    payload = {
+    agent_payload = {
         "action": "chat",
         "userId": hermes_user_id,
         "actorId": actor_id,
@@ -512,12 +758,12 @@ def _handle_feishu(event: dict) -> dict:
         "chatId": chat_id,
         "message": text,
     }
+    delivery = {"chat_id": chat_id, "message_id": message_id}
 
-    agent_response = _invoke_agentcore(session_id, actor_id, payload)
-
-    # Reply via Feishu API.
-    _send_feishu_message(chat_id, message.get("message_id", ""), agent_response)
-
+    _dispatch_or_queue(
+        actor_id=actor_id, channel="feishu",
+        agent_payload=agent_payload, delivery=delivery,
+    )
     return _ok({"status": "ok"})
 
 
@@ -544,7 +790,6 @@ def _send_feishu_message(chat_id: str, message_id: str, text: str) -> None:
 
 def _get_feishu_tenant_token() -> str:
     """Get Feishu tenant_access_token using app credentials."""
-    # Check cache first (token valid for ~2 hours, we cache in Lambda container).
     cached = _secrets_cache.get("_feishu_tenant_token")
     cached_at = _secrets_cache.get("_feishu_tenant_token_at", 0)
     if cached and (time.time() - cached_at) < 6000:  # refresh every ~100 min
@@ -571,11 +816,7 @@ def _get_feishu_tenant_token() -> str:
 # --------------------------------------------------------------------------
 
 def _load_history(session_id: str) -> list[dict]:
-    """Load the most recent conversation turns from DynamoDB.
-
-    Returns a list of {"role": ..., "content": ...} dicts in chronological
-    order, bounded by HISTORY_MAX_TURNS.
-    """
+    """Load the most recent conversation turns from DynamoDB."""
     if HISTORY_MAX_TURNS <= 0:
         return []
     try:
@@ -583,11 +824,11 @@ def _load_history(session_id: str) -> list[dict]:
 
         resp = identity_table.query(
             KeyConditionExpression=Key("PK").eq(f"HIST#{session_id}"),
-            ScanIndexForward=False,  # newest first
-            Limit=HISTORY_MAX_TURNS * 2,  # each turn = user + assistant
+            ScanIndexForward=False,
+            Limit=HISTORY_MAX_TURNS * 2,
         )
         items = resp.get("Items", [])
-        items.reverse()  # chronological order
+        items.reverse()
         return [{"role": item["role"], "content": item["content"]} for item in items]
     except ClientError as exc:
         logger.warning("Failed to load history for %s: %s", session_id, exc)
@@ -595,11 +836,7 @@ def _load_history(session_id: str) -> list[dict]:
 
 
 def _save_history(session_id: str, user_message: str, assistant_message: str) -> None:
-    """Persist a conversation turn (user + assistant) to DynamoDB.
-
-    Items are keyed by millisecond timestamp so they sort chronologically.
-    A TTL attribute enables automatic DynamoDB cleanup of old sessions.
-    """
+    """Persist a conversation turn (user + assistant) to DynamoDB."""
     now_ms = int(time.time() * 1000)
     ttl = int(time.time()) + HISTORY_TTL_DAYS * 86400
 
@@ -632,7 +869,6 @@ def _invoke_agentcore(session_id: str, actor_id: str, payload: dict) -> str:
     """Call InvokeAgentRuntime and return the text response."""
     user_message = payload.get("message", "")
 
-    # Inject conversation history into the payload.
     history = _load_history(session_id)
     if history:
         payload["conversationHistory"] = history
@@ -645,23 +881,20 @@ def _invoke_agentcore(session_id: str, actor_id: str, payload: dict) -> str:
             payload=json.dumps(payload).encode("utf-8"),
         )
 
-        # AgentCore returns the response in the "response" key (may be StreamingBody).
         result = response.get("response", "")
         if hasattr(result, "read"):
             result = result.read()
         if isinstance(result, bytes):
             result = result.decode("utf-8")
 
-        # Parse SSE format: strip "data: " prefix and JSON-decode the payload.
-        # The agent yields any JSON value (string, null, number, etc.), so we
-        # always JSON-decode rather than only handling quoted strings.
+        # Parse SSE: strip "data: " and JSON-decode.
         result = result.strip()
         if result.startswith("data: "):
-            result = result[6:]  # Strip "data: " prefix
+            result = result[6:]
         try:
             decoded = json.loads(result)
         except (json.JSONDecodeError, ValueError):
-            decoded = result  # Non-JSON payload — keep raw string.
+            decoded = result
 
         if decoded is None or decoded == "":
             logger.warning("AgentCore returned empty/null response")
@@ -671,10 +904,11 @@ def _invoke_agentcore(session_id: str, actor_id: str, payload: dict) -> str:
         else:
             result = json.dumps(decoded)
 
-        logger.info("AgentCore response length=%d, status=%s",
-                     len(result), response.get("statusCode", ""))
+        logger.info(
+            "AgentCore response length=%d, status=%s",
+            len(result), response.get("statusCode", ""),
+        )
 
-        # Persist this turn so future requests have context.
         if user_message and result:
             _save_history(session_id, user_message, result)
 
@@ -699,7 +933,6 @@ def _resolve_user(actor_id: str, username: str = "") -> str:
     except ClientError:
         pass
 
-    # New user — create entries.
     user_id = f"user_{hashlib.sha256(actor_id.encode()).hexdigest()[:16]}"
     now = int(time.time())
 
@@ -725,7 +958,6 @@ def _resolve_user(actor_id: str, username: str = "") -> str:
 
 def _is_allowed(actor_id: str) -> bool:
     """Check whether *actor_id* is on the allowlist."""
-    # If IDENTITY_TABLE is not set, allow all (dev mode).
     if not os.environ.get("IDENTITY_TABLE"):
         return True
     try:
@@ -740,7 +972,6 @@ def _is_allowed(actor_id: str) -> bool:
 def _build_session_id(user_id: str, channel: str) -> str:
     """Build an AgentCore session ID (must be >= 33 characters)."""
     base = f"{user_id}:{channel}"
-    # Pad to ensure >= 33 characters.
     if len(base) < 33:
         base = base + ":" + "0" * (33 - len(base) - 1)
     return base
@@ -772,7 +1003,6 @@ def _get_secret(name: str) -> str:
 def _parse_body(event: dict) -> dict:
     body = event.get("body", "{}")
     if isinstance(body, str):
-        # API Gateway may base64-encode the body.
         if event.get("isBase64Encoded"):
             import base64
             body = base64.b64decode(body).decode()
@@ -789,7 +1019,6 @@ def _split_message(text: str, max_len: int = 4096) -> list[str]:
         if len(text) <= max_len:
             chunks.append(text)
             break
-        # Try to split on newline.
         split_at = text.rfind("\n", 0, max_len)
         if split_at == -1:
             split_at = max_len
