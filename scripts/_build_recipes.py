@@ -87,10 +87,24 @@ def _resolve_recipe(entry: dict, idx: int) -> tuple[str, Path, dict]:
     return name, source_dir, _deep_merge(stock, overrides)
 
 
+def _normalize_prompt_list(raw) -> list[str]:
+    """Accept a string, a list of strings, or None — return a list of strings."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    if isinstance(raw, list):
+        return [str(item) for item in raw if item]
+    raise SystemExit(f"system_prompt must be a string or list, got {type(raw).__name__}")
+
+
 def _emit_empty_manifest() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     MANIFEST_PATH.write_text(
-        json.dumps({"secrets": {}, "mcp_servers": {}}, indent=2)
+        json.dumps(
+            {"secrets": {}, "mcp_servers": {}, "system_prompts": []},
+            indent=2,
+        )
     )
 
 
@@ -114,7 +128,7 @@ def main() -> None:
         _emit_empty_manifest()
         return
 
-    manifest: dict = {"secrets": {}, "mcp_servers": {}}
+    manifest: dict = {"secrets": {}, "mcp_servers": {}, "system_prompts": []}
 
     for idx, entry in enumerate(recipes):
         name, source_dir, merged = _resolve_recipe(entry, idx)
@@ -144,6 +158,15 @@ def main() -> None:
 
         manifest["secrets"].update(merged.get("secrets") or {})
         manifest["mcp_servers"].update(merged.get("mcp_servers") or {})
+        manifest["system_prompts"].extend(
+            _normalize_prompt_list(merged.get("system_prompt"))
+        )
+
+    # Deployment-level system_prompt (top-level of recipes.config.yaml) is
+    # appended last so it can reference any recipe loaded above.
+    manifest["system_prompts"].extend(
+        _normalize_prompt_list(config.get("system_prompt"))
+    )
 
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2))
 

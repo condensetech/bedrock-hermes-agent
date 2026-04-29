@@ -157,6 +157,10 @@ _BUILTIN_CHANNEL_SECRETS = {
 
 _RECIPES_MANIFEST_PATH = "/app/recipes_manifest.json"
 
+# Populated by ``_apply_runtime_config`` so ``invoke()`` can tailor the
+# system prompt to the loaded recipe surface (e.g. Sentry+GitHub correlation).
+_RECIPES_MANIFEST: dict = {"secrets": {}, "mcp_servers": {}}
+
 
 def _populate_secrets(secrets: dict) -> None:
     """Fetch each ``SecretId → ENV_VAR`` from Secrets Manager and export the
@@ -193,6 +197,7 @@ def _load_recipes_manifest() -> dict:
     return {
         "secrets": data.get("secrets") or {},
         "mcp_servers": data.get("mcp_servers") or {},
+        "system_prompts": data.get("system_prompts") or [],
     }
 
 
@@ -257,10 +262,11 @@ def _merge_recipe_mcp_servers(servers: dict) -> None:
 def _apply_runtime_config() -> None:
     """Run all build-time-driven runtime setup before AIAgent init: load
     built-in channel secrets, then read the recipes manifest and apply it."""
+    global _RECIPES_MANIFEST
     _populate_secrets(_BUILTIN_CHANNEL_SECRETS)
-    manifest = _load_recipes_manifest()
-    _populate_secrets(manifest["secrets"])
-    _merge_recipe_mcp_servers(manifest["mcp_servers"])
+    _RECIPES_MANIFEST = _load_recipes_manifest()
+    _populate_secrets(_RECIPES_MANIFEST["secrets"])
+    _merge_recipe_mcp_servers(_RECIPES_MANIFEST["mcp_servers"])
 
 
 # Per-request context — set by ``invoke()`` before each agent run, read by
@@ -431,6 +437,14 @@ async def invoke(payload, context):
                 "to access a different channel, decline and explain that "
                 "the bot is restricted to the current channel."
             )
+
+        # Recipe-contributed system prompt additions: per-recipe `system_prompt`
+        # in recipe.yaml (general guidance about a recipe's tools) and the
+        # top-level `system_prompt` in recipes.config.yaml (deployment-level
+        # synergies, e.g. how Sentry releases map to GitHub refs). Joined in
+        # the order the manifest lists them.
+        for prompt in _RECIPES_MANIFEST.get("system_prompts", []):
+            system_extra += "\n\n" + prompt
 
         # Restore conversation history from the gateway payload so the
         # agent has context from previous turns.

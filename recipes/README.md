@@ -42,6 +42,31 @@ Then:
 ./scripts/deploy.sh phase2            # rebuild + redeploy
 ```
 
+## Deployment-level system prompt
+
+`recipes.config.yaml` accepts a top-level `system_prompt:` field — a string
+or list of strings appended to the agent's system prompt on every request.
+This is the right place for cross-recipe synergies (e.g. *"use the Sentry
+event's release as the GitHub ref"*) and deployment-specific tweaks. Stock
+recipes don't reference each other; the deployment decides which tools
+combine and how.
+
+```yaml
+# recipes.config.yaml
+system_prompt:
+  - >
+    When investigating a Sentry issue, correlate it with source code by
+    reading the relevant file from GitHub. Use the Sentry event's `release`
+    field as the GitHub `ref` so you read the exact deployed code.
+
+recipes:
+  - name: sentry
+  - name: github
+```
+
+Order in the final system prompt: each enabled recipe's `system_prompt`
+in declaration order, then the deployment-level `system_prompt`.
+
 ## Per-environment configs
 
 The deploy script reads `${RECIPES_CONFIG:-recipes.config.yaml}`. Pin one file
@@ -81,6 +106,15 @@ mcp_servers:
     # url: "https://example.com/mcp"
     # headers:
     #   Authorization: "Bearer ${EXAMPLE_TOKEN}"
+
+# Optional: text appended to the agent's system prompt whenever this recipe
+# is loaded. Use for tool-usage guidance specific to this recipe (e.g. how
+# to interpret a particular field). Single string or list of strings; both
+# are valid. Cross-recipe synergies belong in recipes.config.yaml's
+# top-level `system_prompt:` instead — recipes shouldn't reference each
+# other by name.
+system_prompt:
+  - "..."
 ```
 
 ## Override merge rules

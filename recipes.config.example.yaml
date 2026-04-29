@@ -14,6 +14,15 @@
 #
 # Available stock recipes are folders under recipes/. Use `path:` instead
 # of `name:` to point at a recipe directory outside this repo.
+#
+# Top-level `system_prompt:` is appended to the agent's system prompt on
+# every request. Use it for cross-recipe synergies and deployment-specific
+# tweaks. Each list entry can be a multi-line string.
+
+# system_prompt:
+#   - >
+#     When investigating a Sentry issue, correlate it with source code via
+#     GitHub. Use the Sentry event's `release` field as the GitHub `ref`.
 
 recipes:
   # Stock recipe, no customization:
