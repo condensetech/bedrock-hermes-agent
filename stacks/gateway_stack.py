@@ -109,6 +109,22 @@ class HermesGatewayStack(Stack):
             )
         )
 
+        # Secrets are encrypted with the project CMK; Secrets Manager calls
+        # kms:Decrypt on the caller's behalf. Scope the grant to Secrets
+        # Manager via kms:ViaService.
+        self.task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="SecretsKmsDecrypt",
+                actions=["kms:Decrypt"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "kms:ViaService": f"secretsmanager.{region}.amazonaws.com",
+                    },
+                },
+            )
+        )
+
         # CloudWatch logs.
         self.task_role.add_to_policy(
             iam.PolicyStatement(

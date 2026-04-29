@@ -123,6 +123,21 @@ class HermesRouterStack(Stack):
             )
         )
 
+        # Secrets are encrypted with the project CMK; Secrets Manager calls
+        # kms:Decrypt on the caller's behalf. Scope the grant to Secrets
+        # Manager via kms:ViaService.
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["kms:Decrypt"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "kms:ViaService": f"secretsmanager.{region}.amazonaws.com",
+                    },
+                },
+            )
+        )
+
         # Allow Lambda to write to S3 (photo uploads).
         self.router_fn.add_to_role_policy(
             iam.PolicyStatement(

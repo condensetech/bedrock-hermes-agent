@@ -74,6 +74,21 @@ class HermesCronStack(Stack):
             )
         )
 
+        # Secrets are encrypted with the project CMK; Secrets Manager calls
+        # kms:Decrypt on the caller's behalf. Scope the grant to Secrets
+        # Manager via kms:ViaService.
+        self.cron_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["kms:Decrypt"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "kms:ViaService": f"secretsmanager.{region}.amazonaws.com",
+                    },
+                },
+            )
+        )
+
         # ---- EventBridge Scheduler role ----------------------------------
         # Schedules are created dynamically via the agent or console.
         # This role allows EventBridge to invoke the Lambda.
