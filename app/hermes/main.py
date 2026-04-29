@@ -236,7 +236,24 @@ async def invoke(payload, context):
             system_message=system_extra,
             conversation_history=history,
         )
-        yield result.get("final_response", "")
+        final_response = result.get("final_response")
+        if not final_response:
+            # hermes-agent returns final_response=None on many failure paths
+            # (API error, codex incomplete, partial response, etc.).  Surface
+            # the diagnostic fields so we don't silently send "null".
+            log.error(
+                "Agent returned no final_response: failed=%s completed=%s "
+                "partial=%s error=%s",
+                result.get("failed"), result.get("completed"),
+                result.get("partial"), result.get("error"),
+            )
+            err = result.get("error")
+            final_response = (
+                f"Sorry, I couldn't generate a response: {err}"
+                if err
+                else "Sorry, I couldn't generate a response."
+            )
+        yield final_response
     except Exception as exc:
         log.error("Agent error: %s\n%s", exc, traceback.format_exc())
         yield f"Sorry, an error occurred: {exc}"
