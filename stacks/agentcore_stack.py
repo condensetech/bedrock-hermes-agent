@@ -79,7 +79,10 @@ class HermesAgentCoreStack(Stack):
             ),
         )
 
-        # Bedrock model invocation.
+        # Bedrock model invocation.  Cross-region inference profiles (e.g.
+        # `eu.anthropic.claude-opus-4-7`) can route requests to any region in
+        # the profile's geo group, so the foundation-model permission must
+        # cover all regions — not only the deploy region.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 sid="BedrockInvoke",
@@ -88,7 +91,7 @@ class HermesAgentCoreStack(Stack):
                     "bedrock:InvokeModelWithResponseStream",
                 ],
                 resources=[
-                    f"arn:aws:bedrock:{region}::foundation-model/*",
+                    "arn:aws:bedrock:*::foundation-model/*",
                     f"arn:aws:bedrock:*:{account}:inference-profile/*",
                 ],
             )
