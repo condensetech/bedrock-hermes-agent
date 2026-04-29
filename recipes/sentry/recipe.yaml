@@ -1,0 +1,12 @@
+name: sentry
+description: Sentry error monitoring & debugging via the official MCP server.
+
+secrets:
+  hermes/sentry-access-token: SENTRY_ACCESS_TOKEN
+
+mcp_servers:
+  sentry:
+    command: "npx"
+    args: ["-y", "@sentry/mcp-server@latest"]
+    env:
+      SENTRY_ACCESS_TOKEN: "${SENTRY_ACCESS_TOKEN}"
