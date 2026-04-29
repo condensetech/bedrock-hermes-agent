@@ -639,16 +639,24 @@ def _invoke_agentcore(session_id: str, actor_id: str, payload: dict) -> str:
         if isinstance(result, bytes):
             result = result.decode("utf-8")
 
-        # Parse SSE format: strip "data: " prefix and JSON-decode the string.
+        # Parse SSE format: strip "data: " prefix and JSON-decode the payload.
+        # The agent yields any JSON value (string, null, number, etc.), so we
+        # always JSON-decode rather than only handling quoted strings.
         result = result.strip()
         if result.startswith("data: "):
             result = result[6:]  # Strip "data: " prefix
-        # May be a JSON-encoded string (with escaped \n, \", etc.)
-        if result.startswith('"') and result.endswith('"'):
-            try:
-                result = json.loads(result)
-            except (json.JSONDecodeError, ValueError):
-                pass
+        try:
+            decoded = json.loads(result)
+        except (json.JSONDecodeError, ValueError):
+            decoded = result  # Non-JSON payload — keep raw string.
+
+        if decoded is None or decoded == "":
+            logger.warning("AgentCore returned empty/null response")
+            result = "Sorry, I couldn't generate a response."
+        elif isinstance(decoded, str):
+            result = decoded
+        else:
+            result = json.dumps(decoded)
 
         logger.info("AgentCore response length=%d, status=%s",
                      len(result), response.get("statusCode", ""))
