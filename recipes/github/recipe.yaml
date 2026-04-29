@@ -1,0 +1,15 @@
+name: github
+description: GitHub repositories — read-only via the official GitHub MCP server.
+
+secrets:
+  hermes/github-token: GITHUB_PERSONAL_ACCESS_TOKEN
+
+mcp_servers:
+  github:
+    command: "github-mcp-server"
+    args:
+      - "stdio"
+      - "--read-only"
+      - "--toolsets=repos,issues,pull_requests"
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN}"
