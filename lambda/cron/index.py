@@ -55,30 +55,30 @@ _init_sentry("hermes/sentry-dsn-cron")
 def handler(event: dict, context: Any) -> dict:
     """EventBridge Scheduler handler.
 
-    Expected event format (set in EventBridge rule input):
+    Expected event format (written by the schedule tool at create time):
     {
         "jobId": "daily_summary",
         "userId": "user_abc123",
-        "actorId": "discord:...",
-        "originChannel": "discord",
-        "originChatId": "...",
+        "actorId": "discord:channel:123456789",
+        "channel": "discord",
+        "chatId": "123456789",
+        "scopeId": "123456789",
+        "sharedContext": true,
         "prompt": "Summarize today's AI news",
-        "delivery": {"channel": "telegram", "chatId": "123456789"}
+        "delivery": {"channel": "discord", "chatId": "123456789"}
     }
     """
     logger.info("Cron event: %s", json.dumps(event))
 
-    job_id = event.get("jobId", f"cron_{int(time.time())}")
-    user_id = event.get("userId", "")
-    actor_id = event.get("actorId", "") or f"cron:{job_id}"
-    origin_channel = event.get("originChannel", "") or "cron"
-    origin_chat_id = event.get("originChatId", "") or ""
-    prompt = event.get("prompt", "")
+    job_id = event["jobId"]
+    user_id = event["userId"]
+    actor_id = event["actorId"]
+    channel = event["channel"]
+    chat_id = event["chatId"]
+    scope_id = event["scopeId"]
+    shared_context = bool(event.get("sharedContext", False))
+    prompt = event["prompt"]
     delivery = event.get("delivery") or {}
-
-    if not user_id or not prompt:
-        logger.error("Missing userId or prompt in cron event")
-        return {"status": "error", "reason": "missing userId or prompt"}
 
     # Skip duplicate firings of the same schedule. CRONFIRE#…/CLAIM is
     # written conditionally — if the previous firing's claim is still
@@ -101,13 +101,15 @@ def handler(event: dict, context: Any) -> dict:
     dispatch_payload = {
         "_dispatch_request": {
             "actor_id": actor_id,
-            "channel": origin_channel,
+            "channel": channel,
             "agent_payload": {
                 "action": "chat",
                 "userId": user_id,
                 "actorId": actor_id,
-                "channel": origin_channel,
-                "chatId": origin_chat_id,
+                "channel": channel,
+                "chatId": chat_id,
+                "scopeId": scope_id,
+                "sharedContext": shared_context,
                 "message": prompt,
             },
             "delivery": {

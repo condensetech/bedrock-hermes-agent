@@ -46,6 +46,48 @@ def test_build_session_id():
     assert "telegram" in session_id
 
 
+def test_decorate_message_dm_bare():
+    """In DM mode the message is left bare — no speaker prefix."""
+    with patch("boto3.resource", return_value=mock_dynamodb_resource), \
+         patch("boto3.client"):
+        from index import Scope, _decorate_message
+
+    scope = Scope(scope_id="user_a", shared=False, display_name="alice")
+    assert _decorate_message(scope, "hello") == "hello"
+
+
+def test_decorate_message_shared_prefixed():
+    """In shared mode the speaker name is prefixed so the model can tell
+    participants apart in the merged history."""
+    with patch("boto3.resource", return_value=mock_dynamodb_resource), \
+         patch("boto3.client"):
+        from index import Scope, _decorate_message
+
+    scope = Scope(scope_id="chan_x", shared=True, display_name="alice")
+    assert _decorate_message(scope, "hello") == "[alice] hello"
+
+
+def test_shared_dispatch_actor_keys_per_channel():
+    """Shared-mode lock+queue actor IDs share a key per channel so two
+    users in the same channel serialise on one queue (instead of racing
+    into one shared session) — and use a different prefix from
+    DM-mode actors so deploys don't collide."""
+    with patch("boto3.resource", return_value=mock_dynamodb_resource), \
+         patch("boto3.client"):
+        from index import Scope, _shared_dispatch_actor
+
+    shared_a = Scope(scope_id="chan_x", shared=True, display_name="alice")
+    shared_b = Scope(scope_id="chan_x", shared=True, display_name="bob")
+    assert (
+        _shared_dispatch_actor("discord", shared_a, "user_a")
+        == _shared_dispatch_actor("discord", shared_b, "user_b")
+        == "discord:channel:chan_x"
+    )
+
+    dm = Scope(scope_id="user_a", shared=False, display_name="alice")
+    assert _shared_dispatch_actor("discord", dm, "user_a") == "discord:user_a"
+
+
 def test_split_message():
     with patch("boto3.resource", return_value=mock_dynamodb_resource), \
          patch("boto3.client"):

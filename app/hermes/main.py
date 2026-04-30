@@ -595,20 +595,18 @@ def _schedule_create(
     channel = delivery_channel or getattr(_request_context, "channel", "") or ""
     chat_id = delivery_chat_id or getattr(_request_context, "chat_id", "") or ""
 
-    # Origin context: where the schedule was created. Used at firing time
-    # so the cron lambda dispatches into the user's existing channel
-    # session (shared lock + queue + AgentCore session, shared
-    # conversation history). Without these, cron runs are isolated.
-    origin_actor_id = getattr(_request_context, "actor_id", "") or ""
-    origin_channel = getattr(_request_context, "channel", "") or ""
-    origin_chat_id = getattr(_request_context, "chat_id", "") or ""
-
+    # Pin the originating session at create time so cron firings re-enter
+    # the same conversation (same lock + queue + AgentCore session + DDB
+    # history) as the channel where the schedule was created — even if
+    # the platform's DM/group resolution shifts later.
     target_input = json.dumps({
         "jobId": name,
         "userId": user_id,
-        "actorId": origin_actor_id,
-        "originChannel": origin_channel,
-        "originChatId": origin_chat_id,
+        "actorId": getattr(_request_context, "actor_id", "") or "",
+        "channel": getattr(_request_context, "channel", "") or "",
+        "chatId": getattr(_request_context, "chat_id", "") or "",
+        "scopeId": getattr(_request_context, "scope_id", "") or "",
+        "sharedContext": bool(getattr(_request_context, "shared_context", False)),
         "prompt": prompt,
         "delivery": {"channel": channel, "chatId": chat_id} if channel else {},
     })
@@ -875,25 +873,46 @@ async def invoke(payload, context):
         _request_context.actor_id = payload.get("actorId") or ""
         _request_context.channel = channel
         _request_context.chat_id = chat_id
+        # ``scope_id`` is the value the router used to derive the session
+        # ID — channel ID in shared mode, user ID in DM mode. The schedule
+        # tool stores it on each schedule so cron firings dispatch back
+        # into the same conversation scope.
+        _request_context.scope_id = payload.get("scopeId") or ""
+        _request_context.shared_context = bool(payload.get("sharedContext"))
         log.info(
             "invoke ctx set: user_id=%r actor_id=%r channel=%r chat_id=%r "
-            "action=%r",
+            "scope_id=%r shared=%s action=%r",
             _request_context.user_id, _request_context.actor_id,
-            channel, chat_id, payload.get("action"),
+            channel, chat_id, _request_context.scope_id,
+            _request_context.shared_context, payload.get("action"),
         )
 
         system_extra = f"The user is contacting you via {channel}."
         if chat_id:
-            system_extra += f" Chat ID: {chat_id}."
-        if channel == "discord" and chat_id:
-            # Layer 3: instruct the model to refuse cross-channel reads.
-            # The guard enforces it regardless, but this surfaces a friendly
-            # refusal message instead of relying on the tool error.
+            # Bind the model to the originating chat. Channel-aware tools
+            # (currently the Discord MCP; future Slack / Telegram tools
+            # would behave the same) must only read or write within this
+            # scope — Discord additionally enforces this via
+            # _install_discord_channel_guard, but the wording is generic
+            # so the same constraint applies on any platform.
             system_extra += (
-                f" This conversation is scoped to Discord channel {chat_id}. "
-                "Discord tools may only read or write this channel — if asked "
-                "to access a different channel, decline and explain that "
-                "the bot is restricted to the current channel."
+                f" This conversation is scoped to {channel} chat "
+                f"{chat_id}. Channel-aware tools must only read or "
+                "write within this scope — if asked to access a "
+                "different channel or chat, decline and explain that "
+                "the assistant is restricted to the current one."
+            )
+        if _request_context.shared_context:
+            # Group-chat mode: multiple participants share this session.
+            # Each user message is prefixed by the router with `[name]`
+            # so the model can tell speakers apart.
+            system_extra += (
+                " Multiple users may participate in this conversation. "
+                "Each incoming message is prefixed with `[name]` "
+                "indicating who sent it; address users by name in your "
+                "replies when it disambiguates. Treat memories, "
+                "schedules, and tool actions as shared by the channel "
+                "unless a participant scopes them to themselves."
             )
 
         # Recipe-contributed system prompt additions: per-recipe `system_prompt`

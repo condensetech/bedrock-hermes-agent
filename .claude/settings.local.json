@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('/Users/gawaine/dev/condense/bedrock-hermes-agent/scripts/deploy.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(/Users/gawaine/dev/condense/bedrock-hermes-agent/scripts/deploy.py --help)",
+      "Bash([ -d \"$HOME/hermes-agent\" ])",
+      "Bash(.venv/bin/python -m pytest tests/ -x --tb=short)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(./scripts/deploy.py phase2 *)",
+      "Bash(python3 -c ' *)",
+      "Bash(aws logs *)",
+      "Bash(aws bedrock-agentcore-control *)",
+      "Bash(aws iam *)",
+      "Bash(aws cloudtrail *)",
+      "Bash(sort -u echo '---xray---' grep -oE 'xray:[A-Z][a-zA-Z]*' /Users/gawaine/.asdf/installs/nodejs/24.12.0/lib/node_modules/@aws/agentcore/dist/cli/index.mjs)",
+      "Bash(aws xray *)"
+    ]
+  }
+}

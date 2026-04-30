@@ -223,6 +223,37 @@ Each container can only access its own user's S3 namespace. Combined with Firecr
 
 ---
 
+## Conversation Scope: Per-User vs Per-Channel
+
+The router decides per-message whether the conversation is **DM-mode** (one human ↔ the bot, isolated state) or **shared-channel mode** (multiple humans share one conversation in a guild channel / group / mpim).
+
+DM detection is platform-specific:
+
+| Platform | Field used to detect DM |
+|---|---|
+| Discord | `body["channel"]["type"] == 1`, fallback to absence of `member` |
+| Telegram | `chat.type == "private"` |
+| Slack | `event["channel_type"] == "im"` |
+| Feishu | `message.chat_type == "p2p"` |
+| GitHub | always shared — keyed by `(repo, issue/PR)` |
+
+The `Scope` decision drives four things in lockstep:
+
+| Concept | DM mode | Shared mode |
+|---|---|---|
+| AgentCore session ID | `{user_id}:{channel}` | `{channel_id}:{channel}` |
+| DDB conversation history (`HIST#…`) | per-user | per-channel |
+| S3 workspace prefix (memories, skills, SQLite) | per-user | per-channel |
+| Lock + queue actor (`INFLIGHT#…` / `QUEUE#…`) | `{channel}:{user_id}` | `{channel}:channel:{channel_id}` |
+
+Allowlist checks (`_is_allowed`) stay user-keyed regardless of mode — gate who can write into the channel; everyone allowed writes into the same shared room.
+
+In shared mode the router prefixes each message with `[displayName] ` before sending to AgentCore, and the container appends a one-paragraph note to the system prompt instructing the model to address users by name. Memories, skills, and schedules created in shared-mode are visible to all participants in that channel.
+
+Schedules pin their creation scope (`scopeId` + `sharedContext`) into the EventBridge target input, so cron firings re-enter the same session as the originating channel even if the platform's DM/group resolution shifts later.
+
+---
+
 ## Data Flow: End-to-End Message
 
 ```

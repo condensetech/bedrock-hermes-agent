@@ -115,6 +115,48 @@ QUEUED_MESSAGE = (
     "I'll reply as soon as I'm done."
 )
 
+
+# --------------------------------------------------------------------------
+# Conversation scope (per-user vs per-channel)
+# --------------------------------------------------------------------------
+#
+# In group chats (Discord guild channels, Telegram groups, Slack public
+# channels, Feishu group chats) every participant sees and contributes to a
+# *shared* conversation with the bot — same AgentCore session, same DDB
+# history, same workspace, lock+queue serialised per-channel. In 1:1 DMs we
+# fall back to the original user-keyed mode.
+#
+# Each handler computes a ``Scope`` by parsing the platform-specific DM
+# signal, then pushes the result through the agent payload (``scopeId`` /
+# ``sharedContext`` / ``displayName``) so ``_process_followup`` can derive
+# the session ID and decorate the message with a speaker tag.
+
+class Scope:
+    __slots__ = ("scope_id", "shared", "display_name")
+
+    def __init__(self, *, scope_id: str, shared: bool, display_name: str):
+        self.scope_id = scope_id
+        self.shared = shared
+        self.display_name = display_name
+
+
+def _decorate_message(scope: Scope, text: str) -> str:
+    """Prefix a speaker tag in shared-channel mode so the model can tell
+    participants apart. DMs are left bare."""
+    if not scope.shared or not scope.display_name:
+        return text
+    return f"[{scope.display_name}] {text}"
+
+
+def _shared_dispatch_actor(channel: str, scope: Scope, user_id: str) -> str:
+    """Return the lock+queue actor id. In shared mode this is keyed on the
+    channel so participants serialise into the same session instead of
+    racing each other; in DM mode it stays per-user. Different prefix
+    keeps the namespaces from colliding during the cutover."""
+    if scope.shared:
+        return f"{channel}:channel:{scope.scope_id}"
+    return f"{channel}:{user_id}"
+
 # Lazy-init the agentcore client (might not be available in test).
 _agentcore_client: Any = None
 
@@ -388,8 +430,10 @@ def _process_followup(ctx: dict) -> dict:
             channel,
         )
     else:
-        user_id = agent_payload.get("userId", "")
-        session_id = _build_session_id(user_id, channel)
+        # ``scopeId`` is set by every caller — webhook handlers per the
+        # per-channel / per-user decision, the cron lambda from the
+        # schedule's stored origin scope.
+        session_id = _build_session_id(agent_payload["scopeId"], channel)
 
     logger.info(
         "Followup: channel=%s actor=%s msg=%r",
@@ -553,34 +597,49 @@ def _handle_telegram(event: dict) -> dict:
         return _ok({"status": "ignored"})
 
     text = message.get("text", "")
-    chat_id = str(message.get("chat", {}).get("id", ""))
+    chat = message.get("chat", {}) or {}
+    chat_id = str(chat.get("id", ""))
     user_id = str(message.get("from", {}).get("id", ""))
     username = message.get("from", {}).get("username", "")
-    actor_id = f"telegram:{user_id}"
+    first_name = message.get("from", {}).get("first_name", "")
+    allowlist_actor = f"telegram:{user_id}"
 
     if not text.strip():
         return _ok({"status": "empty"})
 
-    if not _is_allowed(actor_id):
-        logger.info("Blocked message from %s (not in allowlist)", actor_id)
+    if not _is_allowed(allowlist_actor):
+        logger.info("Blocked message from %s (not in allowlist)", allowlist_actor)
         return _ok({"status": "blocked"})
 
-    hermes_user_id = _resolve_user(actor_id, username=username)
+    # Telegram chat types: private | group | supergroup | channel.
+    # Anything that isn't "private" is a multi-participant chat.
+    is_dm = chat.get("type") == "private"
+    scope = Scope(
+        scope_id=user_id if is_dm else chat_id,
+        shared=not is_dm,
+        display_name=first_name or username or user_id,
+    )
+    dispatch_actor = _shared_dispatch_actor("telegram", scope, user_id)
+
+    hermes_user_id = _resolve_user(allowlist_actor, username=username)
     images = _download_telegram_photos(message)
 
     agent_payload = {
         "action": "chat",
         "userId": hermes_user_id,
-        "actorId": actor_id,
+        "actorId": dispatch_actor,
         "channel": "telegram",
         "chatId": chat_id,
-        "message": text,
+        "scopeId": scope.scope_id,
+        "sharedContext": scope.shared,
+        "displayName": scope.display_name,
+        "message": _decorate_message(scope, text),
         "images": images,
     }
     delivery = {"chat_id": chat_id}
 
     _dispatch_or_queue(
-        actor_id=actor_id, channel="telegram",
+        actor_id=dispatch_actor, channel="telegram",
         agent_payload=agent_payload, delivery=delivery,
     )
     return _ok({"status": "ok"})
@@ -676,25 +735,41 @@ def _handle_slack(event: dict) -> dict:
     channel_id = slack_event.get("channel", "")
     user_id = slack_event.get("user", "")
     thread_ts = slack_event.get("ts")
-    actor_id = f"slack:{user_id}"
+    allowlist_actor = f"slack:{user_id}"
 
-    if not text.strip() or not _is_allowed(actor_id):
+    if not text.strip() or not _is_allowed(allowlist_actor):
         return _ok({"status": "blocked"})
 
-    hermes_user_id = _resolve_user(actor_id)
+    # Slack channel_type: im (1:1 DM) | channel | group | mpim. Treat
+    # anything that isn't "im" as a multi-participant chat.
+    channel_type = slack_event.get("channel_type", "")
+    is_dm = channel_type == "im"
+    scope = Scope(
+        scope_id=user_id if is_dm else channel_id,
+        shared=not is_dm,
+        display_name=user_id,  # Slack only gives us the user_id here;
+        # the model can't reach for a display name without an extra API
+        # call. Worth upgrading later via users.info if it matters.
+    )
+    dispatch_actor = _shared_dispatch_actor("slack", scope, user_id)
+
+    hermes_user_id = _resolve_user(allowlist_actor)
 
     agent_payload = {
         "action": "chat",
         "userId": hermes_user_id,
-        "actorId": actor_id,
+        "actorId": dispatch_actor,
         "channel": "slack",
         "chatId": channel_id,
-        "message": text,
+        "scopeId": scope.scope_id,
+        "sharedContext": scope.shared,
+        "displayName": scope.display_name,
+        "message": _decorate_message(scope, text),
     }
     delivery = {"channel_id": channel_id, "thread_ts": thread_ts}
 
     _dispatch_or_queue(
-        actor_id=actor_id, channel="slack",
+        actor_id=dispatch_actor, channel="slack",
         agent_payload=agent_payload, delivery=delivery,
     )
     return _ok({"status": "ok"})
@@ -804,23 +879,47 @@ def _handle_discord(event: dict) -> dict:
     user = body.get("member", {}).get("user", body.get("user", {}))
     user_id = user.get("id", "")
     channel_id = body.get("channel_id", "")
-    actor_id = f"discord:{user_id}"
+    allowlist_actor = f"discord:{user_id}"
 
-    if not text.strip() or not _is_allowed(actor_id):
+    if not text.strip() or not _is_allowed(allowlist_actor):
         return _ok({"type": 4, "data": {"content": "Access denied."}})
+
+    # Discord channel.type 1 = DM. Anything else (0=guild text, 5=announce,
+    # 11/12=thread, etc.) is multi-participant. The interaction body
+    # doesn't always include the channel object, so fall back to checking
+    # whether the interaction came via a ``user`` (DM) vs a ``member``
+    # (guild) field — Discord guarantees one or the other.
+    channel_type = body.get("channel", {}).get("type")
+    is_dm = (
+        channel_type == 1
+        if channel_type is not None
+        else "member" not in body
+    )
+    display_name = (
+        user.get("global_name") or user.get("username") or user_id
+    )
+    scope = Scope(
+        scope_id=user_id if is_dm else channel_id,
+        shared=not is_dm,
+        display_name=display_name,
+    )
+    dispatch_actor = _shared_dispatch_actor("discord", scope, user_id)
 
     interaction_token = body.get("token", "")
     app_id = body.get("application_id", "")
 
-    hermes_user_id = _resolve_user(actor_id)
+    hermes_user_id = _resolve_user(allowlist_actor)
 
     agent_payload = {
         "action": "chat",
         "userId": hermes_user_id,
-        "actorId": actor_id,
+        "actorId": dispatch_actor,
         "channel": "discord",
         "chatId": channel_id,
-        "message": text,
+        "scopeId": scope.scope_id,
+        "sharedContext": scope.shared,
+        "displayName": scope.display_name,
+        "message": _decorate_message(scope, text),
     }
     delivery = {
         "app_id": app_id,
@@ -829,7 +928,7 @@ def _handle_discord(event: dict) -> dict:
     }
 
     _dispatch_or_queue(
-        actor_id=actor_id, channel="discord",
+        actor_id=dispatch_actor, channel="discord",
         agent_payload=agent_payload, delivery=delivery,
     )
 
@@ -961,6 +1060,7 @@ def _handle_feishu(event: dict) -> dict:
     chat_id = message.get("chat_id", "")
     msg_type = message.get("message_type", "")
     message_id = message.get("message_id", "")
+    chat_type = message.get("chat_type", "")  # p2p | group
 
     if msg_type != "text":
         return _ok({"status": "ignored"})
@@ -971,24 +1071,35 @@ def _handle_feishu(event: dict) -> dict:
     except (json.JSONDecodeError, ValueError):
         text = ""
 
-    actor_id = f"feishu:{user_id}"
-    if not text.strip() or not _is_allowed(actor_id):
+    allowlist_actor = f"feishu:{user_id}"
+    if not text.strip() or not _is_allowed(allowlist_actor):
         return _ok({"status": "blocked"})
 
-    hermes_user_id = _resolve_user(actor_id)
+    is_dm = chat_type == "p2p"
+    scope = Scope(
+        scope_id=user_id if is_dm else chat_id,
+        shared=not is_dm,
+        display_name=user_id,
+    )
+    dispatch_actor = _shared_dispatch_actor("feishu", scope, user_id)
+
+    hermes_user_id = _resolve_user(allowlist_actor)
 
     agent_payload = {
         "action": "chat",
         "userId": hermes_user_id,
-        "actorId": actor_id,
+        "actorId": dispatch_actor,
         "channel": "feishu",
         "chatId": chat_id,
-        "message": text,
+        "scopeId": scope.scope_id,
+        "sharedContext": scope.shared,
+        "displayName": scope.display_name,
+        "message": _decorate_message(scope, text),
     }
     delivery = {"chat_id": chat_id, "message_id": message_id}
 
     _dispatch_or_queue(
-        actor_id=actor_id, channel="feishu",
+        actor_id=dispatch_actor, channel="feishu",
         agent_payload=agent_payload, delivery=delivery,
     )
     return _ok({"status": "ok"})
