@@ -91,9 +91,10 @@ router_stack.add_dependency(agentcore_stack)
 cron_stack = HermesCronStack(
     app,
     f"{project}-cron",
-    agentcore_runtime_arn=agentcore_runtime_arn,
-    agentcore_qualifier=agentcore_qualifier,
+    identity_table_name=router_stack.identity_table.table_name,
+    router_function_name=router_stack.router_fn.function_name,
 )
+cron_stack.add_dependency(router_stack)
 
 token_monitoring_stack = HermesTokenMonitoringStack(
     app,

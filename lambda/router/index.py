@@ -148,6 +148,8 @@ def handler(event: dict, context: Any) -> dict:
         return _process_followup(event["_followup"])
     if event.get("_queued_notice"):
         return _process_queued_notice(event["_queued_notice"])
+    if event.get("_dispatch_request"):
+        return _process_dispatch_request(event["_dispatch_request"])
 
     path = event.get("rawPath", "")
     method = event.get("requestContext", {}).get("http", {}).get("method", "GET")
@@ -336,6 +338,38 @@ def _dispatch_or_queue(
 # Followup processor (the unified async worker)
 # --------------------------------------------------------------------------
 
+def _process_dispatch_request(ctx: dict) -> dict:
+    """Cross-lambda dispatch entry point. Currently used by the cron
+    lambda: when a schedule fires it builds the same shape the router's
+    webhook handlers do (channel + actor_id + agent_payload + delivery)
+    and invokes us asynchronously, so the cron run goes through the
+    same lock + queue + AgentCore session as live channel messages
+    from the user."""
+    try:
+        _dispatch_or_queue(
+            actor_id=ctx["actor_id"],
+            channel=ctx["channel"],
+            agent_payload=ctx["agent_payload"],
+            delivery=ctx.get("delivery") or {},
+        )
+    except Exception:
+        logger.exception("Dispatch-request failed; releasing cron claim if any")
+        _release_cron_claim((ctx.get("delivery") or {}).get("cron_claim_key"))
+        return _ok({"status": "error"}, status=500)
+    return _ok({"status": "dispatched"})
+
+
+def _release_cron_claim(claim_key: Optional[str]) -> None:
+    """Delete a CRONFIRE# claim record so the next firing of the same
+    schedule can proceed. Idempotent. No-op if claim_key is empty."""
+    if not claim_key:
+        return
+    try:
+        identity_table.delete_item(Key={"PK": claim_key, "SK": "CLAIM"})
+    except Exception:
+        logger.warning("Cron claim release failed for %s", claim_key, exc_info=True)
+
+
 def _process_followup(ctx: dict) -> dict:
     """Run one turn end-to-end: agent invocation + channel response, then
     drain the queue (retaining the lock) or release it if empty."""
@@ -375,6 +409,11 @@ def _process_followup(ctx: dict) -> dict:
             f"({type(exc).__name__}: {exc}).",
             success=False,
         )
+
+    # If this followup processed a cron firing, release its claim so the
+    # next firing of the same schedule can proceed. TTL covers crashes;
+    # this is the early-release on the happy path.
+    _release_cron_claim(delivery.get("cron_claim_key"))
 
     # Drain queue, hand off lock if more work; release otherwise.
     next_item = _dequeue(actor_id)
@@ -457,22 +496,43 @@ def _finalize(channel: str, delivery: dict, text: str, success: bool) -> None:
 def _deliver_response(channel: str, delivery: dict, text: str) -> None:
     """Channel-agnostic dispatch to the correct send-message function."""
     if channel == "discord":
-        _patch_discord(
-            app_id=delivery["app_id"],
-            interaction_token=delivery["interaction_token"],
-            text=text,
-        )
+        # Two delivery paths for Discord:
+        # - PATCH the deferred slash-command response (live /ask flow,
+        #   requires interaction_token).
+        # - POST a fresh message to the channel (cron firings, where
+        #   we don't have an interaction_token).
+        if delivery.get("interaction_token"):
+            _patch_discord(
+                app_id=delivery["app_id"],
+                interaction_token=delivery["interaction_token"],
+                text=_with_cron_header(delivery, text),
+            )
+        else:
+            _post_discord_message(
+                channel_id=delivery.get("channel_id") or delivery.get("chatId") or "",
+                text=_with_cron_header(delivery, text),
+            )
     elif channel == "telegram":
-        _send_telegram_message(delivery["chat_id"], text)
+        _send_telegram_message(
+            delivery.get("chat_id") or delivery.get("chatId") or "",
+            _with_cron_header(delivery, text),
+        )
     elif channel == "slack":
         _send_slack_message(
-            delivery["channel_id"], text,
+            delivery.get("channel_id") or delivery.get("chatId") or "",
+            _with_cron_header(delivery, text),
             thread_ts=delivery.get("thread_ts"),
         )
     elif channel == "feishu":
-        _send_feishu_message(
-            delivery["chat_id"], delivery.get("message_id", ""), text,
-        )
+        # Cron firings don't have a triggering message_id to reply to —
+        # send a fresh message to chat_id when message_id is missing.
+        message_id = delivery.get("message_id", "")
+        chat_id = delivery.get("chat_id") or delivery.get("chatId") or ""
+        body = _with_cron_header(delivery, text)
+        if message_id:
+            _send_feishu_message(chat_id, message_id, body)
+        else:
+            _send_feishu_fresh_message(chat_id, body)
     elif channel == "github":
         _post_github_comment(
             delivery["repo_full_name"], delivery["issue_number"], text,
@@ -777,6 +837,77 @@ def _handle_discord(event: dict) -> dict:
     # PATCHed later — first by the queued-notice (if contended) and then by
     # the followup with the real answer.
     return _ok({"type": 5})
+
+
+def _with_cron_header(delivery: dict, text: str) -> str:
+    """If this delivery is a cron firing, prepend a one-line header so
+    the user sees that the message came from a scheduled run."""
+    job_id = delivery.get("cron_job_id") or ""
+    if not job_id:
+        return text
+    return f"⏰ Scheduled run: {job_id}\n\n{text}"
+
+
+def _post_discord_message(channel_id: str, text: str) -> None:
+    """POST a fresh message to a Discord channel using the bot token.
+    Used by cron firings (no interaction_token to PATCH against)."""
+    if not channel_id or not text:
+        logger.warning(
+            "Discord channel POST skipped: empty channel_id=%r or text=%r",
+            channel_id, bool(text),
+        )
+        return
+    token = _get_secret("discord-bot-token")
+    chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)] or [text]
+    logger.info(
+        "Discord channel POST: channel_id=%s chunks=%d text_len=%d",
+        channel_id, len(chunks), len(text),
+    )
+    for idx, chunk in enumerate(chunks):
+        url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+        data = json.dumps({"content": chunk}).encode()
+        req = urllib.request.Request(url, data=data, headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bot {token}",
+            "User-Agent": "HermesAgent/1.0",
+        })
+        try:
+            resp = urllib.request.urlopen(req, timeout=15)
+            resp_body = resp.read().decode("utf-8", errors="replace")
+            logger.info(
+                "Discord channel POST chunk %d/%d status=%d body=%s",
+                idx + 1, len(chunks), resp.status, resp_body[:600],
+            )
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            logger.error(
+                "Discord channel POST failed: %s %s — %s",
+                exc.code, exc.reason, body_text,
+            )
+        except Exception as exc:
+            logger.error("Discord channel POST failed: %s", exc)
+
+
+def _send_feishu_fresh_message(chat_id: str, text: str) -> None:
+    """Post a new message into a Feishu chat (vs. replying to a specific
+    message_id). Used by cron firings."""
+    if not chat_id or not text:
+        return
+    token = _get_feishu_tenant_token()
+    url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+    data = json.dumps({
+        "receive_id": chat_id,
+        "msg_type": "text",
+        "content": json.dumps({"text": text}),
+    }).encode()
+    req = urllib.request.Request(url, data=data, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {token}",
+    })
+    try:
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as exc:
+        logger.error("Feishu fresh-message failed: %s", exc)
 
 
 def _patch_discord(*, app_id: str, interaction_token: str, text: str) -> None:

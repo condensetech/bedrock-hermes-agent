@@ -347,6 +347,403 @@ def _install_discord_channel_guard() -> None:
     _dt._run_discord_action = guarded
 
 
+def _register_schedule_tool() -> None:
+    """Register a custom ``schedule`` tool against hermes-agent's tool
+    registry. Replaces hermes-agent's in-process ``cronjob`` tool, which
+    assumes a long-running daemon (CLI mode) and is non-functional on
+    AgentCore microVMs.
+
+    The tool calls AWS EventBridge Scheduler directly via boto3. When a
+    schedule fires, EventBridge invokes the project's cron lambda
+    (``hermes-agentcore-cron``), which in turn re-invokes AgentCore with
+    the configured prompt and posts the result back to the configured
+    channel. Schedules are namespaced per-user (``hermes-{userId}-…``)
+    so users can only see and modify their own.
+    """
+    try:
+        from tools.registry import registry
+    except Exception:
+        log.warning("Could not import tools.registry; skipping schedule tool")
+        return
+
+    # NOTE: hermes-agent's registry expects the BARE schema (name,
+    # description, parameters). The registry itself wraps it in
+    # {"type": "function", "function": ...} when emitting to the model.
+    # Pre-wrapping here would double-nest and the model wouldn't see the
+    # parameters.
+    schema = {
+        "name": "schedule",
+        "description": (
+            "Manage scheduled tasks (cron jobs). Single tool with an "
+            "action parameter: create | list | get | delete | pause | "
+            "resume.\n\n"
+            "When a schedule fires, the cron lambda dispatches the "
+            "prompt back into your same channel session — same "
+            "conversation history, same workspace. The reply is "
+            "posted back to the channel.\n\n"
+            "Schedule expression syntax (AWS EventBridge, UTC):\n"
+            "  cron(<minute> <hour> <day-of-month> <month> "
+            "<day-of-week> <year>)\n"
+            "  rate(<value> <unit>)   unit ∈ {minute,minutes,hour,"
+            "hours,day,days}\n\n"
+            "Examples:\n"
+            "  cron(0 9 * * ? *)       → every day 09:00 UTC\n"
+            "  cron(0 9 ? * MON-FRI *) → weekdays 09:00 UTC\n"
+            "  rate(1 day)             → every 24 hours\n\n"
+            "Defaults: when delivery_channel/delivery_chat_id are "
+            "omitted on create, the response is delivered to the "
+            "channel that created the schedule.\n\n"
+            "This is the ONLY way to schedule recurring work. If "
+            "asked to schedule something, call this tool — do not "
+            "promise a schedule without invoking the tool."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "create", "list", "get", "delete",
+                        "pause", "resume",
+                    ],
+                    "description": "Operation to perform.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Schedule name. Required for create / get / "
+                        "delete / pause / resume. Letters, digits, "
+                        "hyphens, underscores. 1-32 chars."
+                    ),
+                },
+                "expression": {
+                    "type": "string",
+                    "description": (
+                        "Schedule expression (required for create). "
+                        "AWS format: 'cron(...)' or 'rate(...)' as "
+                        "above. UTC."
+                    ),
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "Prompt to run when the schedule fires "
+                        "(required for create). The agent runs this "
+                        "in the same session as the originating "
+                        "channel, with full tool access."
+                    ),
+                },
+                "delivery_channel": {
+                    "type": "string",
+                    "enum": ["discord", "telegram", "slack", "feishu"],
+                    "description": (
+                        "Optional. Channel to deliver the response "
+                        "to. Defaults to the channel that created "
+                        "the schedule."
+                    ),
+                },
+                "delivery_chat_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional. Channel-specific destination ID "
+                        "(e.g., Discord channel ID). Defaults to the "
+                        "chat that created the schedule."
+                    ),
+                },
+            },
+            "required": ["action"],
+        },
+    }
+
+    def handler(args, **_kwargs):  # noqa: ANN001
+        ctx_user = getattr(_request_context, "user_id", None)
+        ctx_actor = getattr(_request_context, "actor_id", None)
+        ctx_channel = getattr(_request_context, "channel", None)
+        ctx_chat = getattr(_request_context, "chat_id", None)
+        log.info(
+            "schedule tool invoked: args=%s ctx user_id=%r actor_id=%r "
+            "channel=%r chat_id=%r",
+            args, ctx_user, ctx_actor, ctx_channel, ctx_chat,
+        )
+        # Breadcrumbs only — they attach to any subsequent error event
+        # without flooding Sentry with one INFO event per schedule call.
+        try:
+            sentry_sdk.set_tag("schedule.action", (args or {}).get("action"))
+            sentry_sdk.add_breadcrumb(
+                category="schedule", level="info",
+                message="schedule tool invoked",
+                data={
+                    "action": (args or {}).get("action"),
+                    "user_id": ctx_user, "channel": ctx_channel,
+                },
+            )
+        except Exception:
+            pass
+        try:
+            result = _schedule_dispatch(args)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Schedule tool failed")
+            return json.dumps({"error": "tool_failure", "message": str(exc)})
+        log.info("schedule tool result: %s", result)
+        return result
+
+    registry.register(
+        name="schedule",
+        toolset="schedule",
+        schema=schema,
+        handler=handler,
+        emoji="⏰",
+        description=(
+            "Schedule recurring agent runs via AWS EventBridge Scheduler."
+        ),
+    )
+    log.info("Schedule tool registered")
+
+
+# --------------------------------------------------------------------------
+# Schedule tool — handlers
+# --------------------------------------------------------------------------
+
+_SCHEDULE_NAME_RE = "^[A-Za-z0-9_-]{1,32}$"
+_PROJECT_NAME = "hermes-agentcore"
+
+
+def _schedule_aws_clients():
+    import boto3
+    region = _get_region()
+    sts = boto3.client("sts", region_name=region)
+    account = sts.get_caller_identity()["Account"]
+    return boto3.client("scheduler", region_name=region), region, account
+
+
+def _schedule_lambda_arn(region: str, account: str) -> str:
+    return f"arn:aws:lambda:{region}:{account}:function:{_PROJECT_NAME}-cron"
+
+
+def _schedule_role_arn(account: str) -> str:
+    return f"arn:aws:iam::{account}:role/{_PROJECT_NAME}-scheduler-role"
+
+
+def _schedule_full_name(user_id: str, name: str) -> str:
+    """Namespace the user-visible schedule name into a globally unique one."""
+    return f"hermes-{user_id}-{name}"
+
+
+def _schedule_user_prefix(user_id: str) -> str:
+    return f"hermes-{user_id}-"
+
+
+def _ctx_user_id() -> str:
+    user_id = getattr(_request_context, "user_id", None)
+    if not user_id:
+        raise RuntimeError(
+            "schedule tool: no user_id in request context — schedule "
+            "creation requires a known caller."
+        )
+    return user_id
+
+
+def _schedule_dispatch(args: dict) -> str:
+    import re
+    action = (args.get("action") or "").strip()
+    if action == "create":
+        name = args.get("name") or ""
+        if not re.match(_SCHEDULE_NAME_RE, name):
+            return json.dumps({
+                "error": "invalid_name",
+                "message": "name must match [A-Za-z0-9_-]{1,32}",
+            })
+        expression = (args.get("expression") or "").strip()
+        prompt = (args.get("prompt") or "").strip()
+        if not expression or not prompt:
+            return json.dumps({
+                "error": "missing_field",
+                "message": "create requires expression and prompt",
+            })
+        return _schedule_create(
+            name=name,
+            expression=expression,
+            prompt=prompt,
+            delivery_channel=args.get("delivery_channel") or "",
+            delivery_chat_id=args.get("delivery_chat_id") or "",
+        )
+    if action == "list":
+        return _schedule_list()
+    if action == "get":
+        name = args.get("name") or ""
+        return _schedule_get(name)
+    if action == "delete":
+        name = args.get("name") or ""
+        return _schedule_delete(name)
+    if action in ("pause", "resume"):
+        name = args.get("name") or ""
+        return _schedule_set_state(
+            name, "DISABLED" if action == "pause" else "ENABLED",
+        )
+    return json.dumps({"error": "unknown_action", "action": action})
+
+
+def _schedule_create(
+    *, name: str, expression: str, prompt: str,
+    delivery_channel: str, delivery_chat_id: str,
+) -> str:
+    user_id = _ctx_user_id()
+    full_name = _schedule_full_name(user_id, name)
+    client, region, account = _schedule_aws_clients()
+
+    # Default delivery to the channel that originated this request.
+    channel = delivery_channel or getattr(_request_context, "channel", "") or ""
+    chat_id = delivery_chat_id or getattr(_request_context, "chat_id", "") or ""
+
+    # Origin context: where the schedule was created. Used at firing time
+    # so the cron lambda dispatches into the user's existing channel
+    # session (shared lock + queue + AgentCore session, shared
+    # conversation history). Without these, cron runs are isolated.
+    origin_actor_id = getattr(_request_context, "actor_id", "") or ""
+    origin_channel = getattr(_request_context, "channel", "") or ""
+    origin_chat_id = getattr(_request_context, "chat_id", "") or ""
+
+    target_input = json.dumps({
+        "jobId": name,
+        "userId": user_id,
+        "actorId": origin_actor_id,
+        "originChannel": origin_channel,
+        "originChatId": origin_chat_id,
+        "prompt": prompt,
+        "delivery": {"channel": channel, "chatId": chat_id} if channel else {},
+    })
+
+    log.info(
+        "schedule create: full_name=%s expression=%s region=%s account=%s "
+        "target_lambda=%s role=%s delivery_channel=%s delivery_chat_id=%s",
+        full_name, expression, region, account,
+        _schedule_lambda_arn(region, account),
+        _schedule_role_arn(account),
+        channel, chat_id,
+    )
+    try:
+        resp = client.create_schedule(
+            Name=full_name,
+            ScheduleExpression=expression,
+            ScheduleExpressionTimezone="UTC",
+            FlexibleTimeWindow={"Mode": "OFF"},
+            State="ENABLED",
+            Target={
+                "Arn": _schedule_lambda_arn(region, account),
+                "RoleArn": _schedule_role_arn(account),
+                "Input": target_input,
+                # Don't retry on dispatch failure. The cron lambda has
+                # its own dedup + best-effort dispatch; if a single
+                # firing fails to dispatch, we'd rather skip it than
+                # double-fire on retry.
+                "RetryPolicy": {
+                    "MaximumRetryAttempts": 0,
+                },
+            },
+        )
+        log.info("schedule create response: %s", resp)
+    except client.exceptions.ConflictException:
+        log.info("schedule create conflict for %s", full_name)
+        return json.dumps({
+            "error": "schedule_exists",
+            "message": f"A schedule named '{name}' already exists. "
+                       "Delete it first or pick a different name.",
+        })
+    except Exception as exc:  # noqa: BLE001
+        log.exception("schedule create failed for %s", full_name)
+        return json.dumps({"error": "create_failed", "message": str(exc)})
+
+    return json.dumps({
+        "ok": True, "name": name, "expression": expression,
+        "delivery": {"channel": channel, "chatId": chat_id} if channel else None,
+    })
+
+
+def _schedule_list() -> str:
+    user_id = _ctx_user_id()
+    client, _region, _account = _schedule_aws_clients()
+    prefix = _schedule_user_prefix(user_id)
+    items = []
+    next_token = None
+    while True:
+        kwargs = {"NamePrefix": prefix, "MaxResults": 100}
+        if next_token:
+            kwargs["NextToken"] = next_token
+        resp = client.list_schedules(**kwargs)
+        for s in resp.get("Schedules") or []:
+            items.append({
+                "name": (s.get("Name") or "")[len(prefix):],
+                "state": s.get("State"),
+                "createdAt": s.get("CreationDate").isoformat() if s.get("CreationDate") else None,
+            })
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
+    return json.dumps({"ok": True, "schedules": items})
+
+
+def _schedule_get(name: str) -> str:
+    user_id = _ctx_user_id()
+    client, _region, _account = _schedule_aws_clients()
+    full_name = _schedule_full_name(user_id, name)
+    try:
+        resp = client.get_schedule(Name=full_name)
+    except client.exceptions.ResourceNotFoundException:
+        return json.dumps({"error": "not_found", "name": name})
+    target = resp.get("Target") or {}
+    try:
+        target_input = json.loads(target.get("Input") or "{}")
+    except (json.JSONDecodeError, ValueError):
+        target_input = {}
+    return json.dumps({
+        "ok": True,
+        "name": name,
+        "expression": resp.get("ScheduleExpression"),
+        "state": resp.get("State"),
+        "delivery": target_input.get("delivery") or {},
+        "prompt": target_input.get("prompt") or "",
+        "createdAt": resp.get("CreationDate").isoformat() if resp.get("CreationDate") else None,
+    })
+
+
+def _schedule_delete(name: str) -> str:
+    user_id = _ctx_user_id()
+    client, _region, _account = _schedule_aws_clients()
+    full_name = _schedule_full_name(user_id, name)
+    try:
+        client.delete_schedule(Name=full_name)
+    except client.exceptions.ResourceNotFoundException:
+        return json.dumps({"error": "not_found", "name": name})
+    return json.dumps({"ok": True, "name": name})
+
+
+def _schedule_set_state(name: str, state: str) -> str:
+    user_id = _ctx_user_id()
+    client, _region, _account = _schedule_aws_clients()
+    full_name = _schedule_full_name(user_id, name)
+    try:
+        existing = client.get_schedule(Name=full_name)
+    except client.exceptions.ResourceNotFoundException:
+        return json.dumps({"error": "not_found", "name": name})
+    target = existing.get("Target") or {}
+    try:
+        client.update_schedule(
+            Name=full_name,
+            ScheduleExpression=existing["ScheduleExpression"],
+            ScheduleExpressionTimezone=existing.get("ScheduleExpressionTimezone", "UTC"),
+            FlexibleTimeWindow=existing.get("FlexibleTimeWindow") or {"Mode": "OFF"},
+            State=state,
+            Target={
+                "Arn": target.get("Arn"),
+                "RoleArn": target.get("RoleArn"),
+                "Input": target.get("Input"),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": "update_failed", "message": str(exc)})
+    return json.dumps({"ok": True, "name": name, "state": state})
+
+
 def get_or_create_agent(channel: str = "agentcore"):
     """Lazy-init the full hermes-agent. Blocks on first call (~5-15s)."""
     global _agent
@@ -388,6 +785,11 @@ def get_or_create_agent(channel: str = "agentcore"):
 
     run_agent.AIAgent = _BedrockAIAgent
 
+    # Replace hermes-agent's cronjob tool (assumes a CLI daemon — non-
+    # functional on AgentCore microVMs) with our schedule tool that
+    # talks to AWS EventBridge Scheduler.
+    _register_schedule_tool()
+
     # Use Bedrock model ID directly. The monkey-patched anthropic SDK
     # routes everything through Bedrock automatically.
     model = os.environ.get("BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-6")
@@ -398,8 +800,11 @@ def get_or_create_agent(channel: str = "agentcore"):
         platform=channel,
         # Layer 1 of channel-scope defence: never expose discord_admin
         # (server-wide listing/management actions). Layer 2 lives in
-        # _install_discord_channel_guard.
-        disabled_toolsets=["discord_admin"],
+        # _install_discord_channel_guard. Cronjob is disabled because
+        # hermes-agent's in-process cron daemon doesn't run on
+        # per-session microVMs — see _register_schedule_tool for the
+        # AWS-backed replacement.
+        disabled_toolsets=["discord_admin", "cronjob"],
         quiet_mode=True,
     )
 
@@ -461,6 +866,21 @@ async def invoke(payload, context):
         # Layer 2 of the defence: tool calls reaching a different channel_id
         # are rejected with channel_out_of_scope before hitting Discord.
         _request_context.channel_id = chat_id if channel == "discord" else None
+        # The schedule tool needs to know who's scheduling and where the
+        # default delivery should land if not specified explicitly. The
+        # actor_id is plumbed through to scheduled runs so they share
+        # the user's normal lock + queue + AgentCore session — i.e.
+        # cron firings serialise with live channel messages.
+        _request_context.user_id = payload.get("userId") or ""
+        _request_context.actor_id = payload.get("actorId") or ""
+        _request_context.channel = channel
+        _request_context.chat_id = chat_id
+        log.info(
+            "invoke ctx set: user_id=%r actor_id=%r channel=%r chat_id=%r "
+            "action=%r",
+            _request_context.user_id, _request_context.actor_id,
+            channel, chat_id, payload.get("action"),
+        )
 
         system_extra = f"The user is contacting you via {channel}."
         if chat_id:

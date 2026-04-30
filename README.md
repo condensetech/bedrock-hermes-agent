@@ -357,6 +357,16 @@ The router lambda tags every event with `channel` and `actor_id`, so Sentry's UI
 
 See [docs/SENTRY_SETUP.md](docs/SENTRY_SETUP.md) for the project-creation walkthrough, deeper detail on what each component reports, and how to disable / rotate / extend (Phase 4 gateway, tracing).
 
+## Scheduling (recurring tasks)
+
+Hermes can run prompts on a recurring schedule via AWS EventBridge Scheduler. Ask in any channel — *"every weekday at 9am UTC, summarise yesterday's PRs in condensetech and post here"* — and the agent calls a `schedule` tool that creates a real EventBridge schedule. When it fires, the cron lambda re-invokes the agent with the prompt and posts the result back.
+
+This **replaces hermes-agent's built-in `cronjob` tool**, which assumed a long-running CLI daemon and is non-functional on AgentCore's per-session microVMs (the `cronjob` toolset is explicitly disabled in `app/hermes/main.py`).
+
+The `schedule` tool exposes six actions: `create`, `list`, `get`, `delete`, `pause`, `resume`. Schedules are namespaced per-user (full AWS name `hermes-{userId}-{shortName}`); the agent and the user only see the short name. Delivery defaults to the channel that created the schedule and supports Discord, Telegram, Slack, and Feishu. Schedule expressions are AWS-format (`cron(...)` or `rate(...)`), UTC.
+
+No extra setup is required beyond the standard phases — `phase1` provisions the IAM permissions and the scheduler role, `phase3` provisions the cron lambda, and `phase2` ships the agent with the `schedule` tool registered. See [docs/CRON_SETUP.md](docs/CRON_SETUP.md) for the end-to-end flow, troubleshooting, and known limits (no per-user timezones yet, no `update` action — delete and recreate).
+
 ## Cost Estimate (10 active users)
 
 | Component | Monthly |
@@ -380,6 +390,7 @@ See [docs/SENTRY_SETUP.md](docs/SENTRY_SETUP.md) for the project-creation walkth
 | [FEISHU_SETUP.md](docs/FEISHU_SETUP.md) | Feishu (Lark) bot configuration |
 | [GITHUB_SETUP.md](docs/GITHUB_SETUP.md) | GitHub org-level webhook for @-mention triggers |
 | [SENTRY_SETUP.md](docs/SENTRY_SETUP.md) | Sentry observability — per-component DSN setup |
+| [CRON_SETUP.md](docs/CRON_SETUP.md) | Scheduling recurring agent runs via EventBridge |
 | [AGENTCORE_CONTRACT.md](docs/AGENTCORE_CONTRACT.md) | HTTP contract protocol details |
 
 ## Reference

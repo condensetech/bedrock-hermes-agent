@@ -129,6 +129,62 @@ class HermesAgentCoreStack(Stack):
             )
         )
 
+        # EventBridge Scheduler — agent uses this to manage its own
+        # scheduled tasks (the ``schedule`` tool in app/hermes/main.py).
+        # Scoped to the ``hermes-*`` name prefix so the agent can't read
+        # or modify schedules outside its own namespace.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="SchedulerManage",
+                actions=[
+                    "scheduler:CreateSchedule",
+                    "scheduler:GetSchedule",
+                    "scheduler:UpdateSchedule",
+                    "scheduler:DeleteSchedule",
+                ],
+                resources=[
+                    f"arn:aws:scheduler:{region}:{account}:schedule/default/hermes-*",
+                ],
+            )
+        )
+        # ListSchedules' NamePrefix filter is request-side, not an IAM
+        # resource constraint — allow account-wide list. Content scoping
+        # to the caller's namespace is enforced in the schedule tool.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="SchedulerList",
+                actions=["scheduler:ListSchedules"],
+                resources=["*"],
+            )
+        )
+        # Required so the agent can pass the scheduler-role ARN as
+        # ``Target.RoleArn`` when creating a schedule (EventBridge then
+        # assumes that role to invoke the cron lambda).
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="SchedulerPassRole",
+                actions=["iam:PassRole"],
+                resources=[
+                    f"arn:aws:iam::{account}:role/{project}-scheduler-role",
+                ],
+                conditions={
+                    "StringEquals": {
+                        "iam:PassedToService": "scheduler.amazonaws.com",
+                    },
+                },
+            )
+        )
+        # STS GetCallerIdentity — used by the schedule tool to derive
+        # the account ID at runtime when constructing the lambda /
+        # scheduler-role ARNs.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="StsCallerIdentity",
+                actions=["sts:GetCallerIdentity"],
+                resources=["*"],
+            )
+        )
+
         # KMS — decrypt secrets and S3 objects.
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
@@ -161,15 +217,54 @@ class HermesAgentCoreStack(Stack):
             )
         )
 
-        # CloudWatch — logging and metrics.
+        # Observability — must mirror the perms agentcore-cdk's HarnessRole
+        # wires up. Without DescribeLogStreams the container's log shipper
+        # can't find the runtime's log stream and writes silently drop on
+        # the floor (regressed v5→v6 when we replaced the CLI auto-role
+        # with this CDK-managed one).
+        runtime_lg = (
+            f"arn:aws:logs:{region}:{account}:"
+            f"log-group:/aws/bedrock-agentcore/runtimes/*"
+        )
         self.execution_role.add_to_policy(
             iam.PolicyStatement(
-                sid="CloudWatch",
+                sid="CloudWatchLogsGroup",
+                actions=["logs:CreateLogGroup", "logs:DescribeLogStreams"],
+                resources=[runtime_lg],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="CloudWatchLogsDescribeGroups",
+                actions=["logs:DescribeLogGroups"],
+                resources=[f"arn:aws:logs:{region}:{account}:log-group:*"],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="CloudWatchLogsStream",
+                actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                resources=[f"{runtime_lg}:log-stream:*"],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="CloudWatchMetricsPublish",
+                actions=["cloudwatch:PutMetricData"],
+                resources=["*"],
+                conditions={
+                    "StringEquals": {"cloudwatch:namespace": "bedrock-agentcore"},
+                },
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="XRayTracingAccess",
                 actions=[
-                    "logs:CreateLogGroup",
-                    "logs:CreateLogStream",
-                    "logs:PutLogEvents",
-                    "cloudwatch:PutMetricData",
+                    "xray:PutTraceSegments",
+                    "xray:PutTelemetryRecords",
+                    "xray:GetSamplingRules",
+                    "xray:GetSamplingTargets",
                 ],
                 resources=["*"],
             )

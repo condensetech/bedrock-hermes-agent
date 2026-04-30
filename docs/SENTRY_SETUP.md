@@ -230,19 +230,138 @@ exception around the `_init_sentry` call. The most common cause is a
 fresh microVM that ran before the secret was created — bump up a
 minute and the next session will pick up the DSN.
 
-## Open boundaries (deliberately not done yet)
+## Deferred work
 
-- **ECS Gateway (Phase 4)**: same pattern would apply, but Phase 4
-  isn't always deployed. Add when you redeploy the gateway.
-- **Tracing / performance**: `traces_sample_rate=0.0` everywhere.
-  Flip on per-component when you want timing data.
-- **OpenTelemetry-based instrumentation**: Sentry has an experimental
-  OTel-based path that may eventually replace the
-  `AwsLambdaIntegration`. Currently marked as "not for production" by
-  Sentry; revisit when it's GA.
-- **`scripts/setup_sentry.sh` helper**: not shipped — secret creation
-  via raw `aws secretsmanager` works fine. Add the helper if the
-  per-component-DSN ceremony becomes annoying.
+These were considered and deliberately deferred. Each entry is a
+self-contained note for picking the work up later without re-deriving
+the context.
+
+### 1. ECS Gateway (Phase 4) Sentry init
+
+**Why deferred** — Phase 4 (the WeChat / Feishu-WebSocket ECS gateway)
+isn't always deployed. Adding code that won't run wastes time; better to
+ship at the next phase 4 deploy.
+
+**When to resume** — next time you `./scripts/deploy.sh phase4`, or if
+you start seeing gateway-side issues you'd want in Sentry.
+
+**How** — same shape as the AgentCore container:
+1. Add `sentry-sdk>=2,<3` to `gateway/`'s `pip install` (check the
+   gateway's Dockerfile for the equivalent of `app/hermes/Dockerfile`'s
+   install line).
+2. Add `_init_sentry("hermes/sentry-dsn-gateway")` near the top of
+   `gateway/main.py` — copy the helper from `app/hermes/main.py`.
+3. Create the secret: `aws secretsmanager create-secret --name
+   hermes/sentry-dsn-gateway --secret-string '<DSN>' --region eu-central-1`.
+4. New Sentry project recommended: `hermes-gateway`.
+5. Update README's Sentry table + this doc's "What's covered" table
+   when adding.
+
+**Effort** — ~30 min, mostly mechanical.
+
+### 2. `scripts/setup_sentry.sh` helper
+
+**Why deferred** — DSNs are infrequent to rotate (set-and-forget), and
+the raw `aws secretsmanager` commands are fine for the 4–5 secrets you
+need. Convenience but not ergonomically blocking.
+
+**When to resume** — if you find yourself rotating DSNs frequently or
+onboarding teammates who'd benefit from a single command.
+
+**How** — model after `scripts/setup_github_webhook.sh`. Subcommands:
+- `init [component]` — generate/store DSN; `[component]` optional, prompts otherwise.
+- `status` — shows which `hermes/sentry-dsn-*` secrets exist + their
+  associated component names.
+- `disable [component]` — deletes a single DSN secret.
+- `rotate [component]` — `put-secret-value` with a new DSN.
+
+Components list: `router`, `cron`, `token-metrics`, `runtime`,
+`gateway`. Map component name → secret ID via a static dict in the
+script.
+
+**Effort** — ~1 hour for a polished version.
+
+### 3. Tracing / performance monitoring
+
+**Why deferred** — `traces_sample_rate=0.0` everywhere. Errors-only is
+the right first posture; tracing adds spans for every request, DDB
+call, AgentCore call, etc., which costs Sentry quota and adds work to
+instrument the right call sites.
+
+**When to resume** — when you actually want timing data (e.g., "this PR
+review took 8 min, where exactly was the bottleneck?"). Or if you're
+debugging a class of intermittent slowness that errors-only doesn't
+catch.
+
+**How**:
+1. In each `_init_sentry()` block, set `traces_sample_rate=0.1` (or
+   higher per-component depending on volume — router will be highest).
+2. Add `profiles_sample_rate=0.1` if you want continuous profiling
+   alongside.
+3. Optionally add custom spans around expensive operations using
+   `with sentry_sdk.start_span(op="...", name="..."):`. Likely
+   candidates: AgentCore invoke, channel-API POSTs, MCP server calls.
+4. Re-deploy each component (`phase2` for container, `phase3` for
+   lambdas).
+5. Check Sentry → Performance to see traces flowing.
+
+**Effort** — sample-rate flip is 10 min, custom span instrumentation
+is open-ended (~1–4 hours depending on coverage you want).
+
+**Quota note** — Sentry's free tier includes a small number of
+performance units; check your plan before flipping sample rates above
+0.1 in production.
+
+### 4. OpenTelemetry-based instrumentation
+
+**Why deferred** — Sentry's OTel integration for AWS Lambda is marked
+`experimental` / `not recommended for production` (last checked, 2026).
+The `AwsLambdaIntegration` we're using is the current production-stable
+path.
+
+**When to resume** — when Sentry promotes the OTel path to GA. Check
+their changelog or `sentry_sdk.integrations.opentelemetry` module
+status. Migration would unify Sentry tracing with any OTel-based
+infrastructure you might add later (e.g., metrics via OpenTelemetry
+Collector → Prometheus / Datadog).
+
+**How** — replace `AwsLambdaIntegration` with the OTel-based equivalent
+in each lambda's `_init_sentry()`, install `sentry-sdk[opentelemetry]`
+extra. Sentry will likely publish a migration guide; follow that.
+
+**Effort** — small if it's a 1:1 swap; potentially large if
+auto-instrumentation collides with our manual spans (none today).
+
+### 5. Sentry GitHub release tracking integration
+
+**Why deferred** — we already stamp `RELEASE_SHA` on every event, so
+Sentry shows the SHA. The next step is wiring Sentry's "Releases"
+feature to GitHub so issues link directly to commits and you get
+"first/last seen in commit" attribution.
+
+**When to resume** — anytime; it's purely a Sentry-side configuration
+that doesn't touch our code.
+
+**How**:
+1. In Sentry: **Settings → Integrations → GitHub** → connect
+   `condensetech` org.
+2. **Settings → [project] → Releases** → enable auto-creation of
+   releases keyed off the `release` field on events.
+3. Optional: set up a Sentry "Suspect Commits" rule so each issue
+   surfaces likely-causing commits based on author / blame.
+
+**Effort** — ~15 min, no code change.
+
+### 6. `RELEASE_SHA` -dirty handling at deploy time
+
+**Status** — implemented. `scripts/deploy.sh` adds `-dirty` to the SHA
+when the working tree has uncommitted changes; events from such
+deploys show `release: <sha>-dirty` in Sentry.
+
+**Possible follow-up** — refuse to deploy from a dirty tree on
+production? Currently we just tag and proceed. Adding a guard would be
+~3 lines but blocks legitimate "test this thing fast" deploys. Leave
+opt-in via env var like `STRICT_RELEASE=1` if it ever bites.
 
 ## Sentry DSN — public or private?
 

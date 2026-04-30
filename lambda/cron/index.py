@@ -1,14 +1,13 @@
-"""Cron Lambda — EventBridge Scheduler → AgentCore invocation.
+"""Cron Lambda — EventBridge Scheduler → Router Lambda dispatch.
 
-Receives scheduled events from EventBridge and dispatches ``cron`` actions to
-the user's AgentCore container.  The container's hermes-agent executes the
-prompt and returns the result; this Lambda can optionally deliver the output
-to a channel (Telegram, Slack, etc.).
+Receives scheduled events from EventBridge, deduplicates same-jobId
+firings via a DDB claim record, then async-invokes the router lambda's
+``_dispatch_request`` entry point so the agent run shares the user's
+normal lock + queue + AgentCore session as live channel messages.
 
 Environment variables:
-    AGENTCORE_RUNTIME_ARN  — AgentCore runtime ARN
-    AGENTCORE_QUALIFIER    — Runtime qualifier / endpoint
-    IDENTITY_TABLE         — DynamoDB table for user lookups
+    ROUTER_FUNCTION_NAME   — router lambda to dispatch into
+    IDENTITY_TABLE         — DynamoDB table for claim records
 """
 
 from __future__ import annotations
@@ -17,11 +16,9 @@ import json
 import logging
 import os
 import time
-import urllib.request
 from typing import Any
 
 import boto3
-from botocore.config import Config
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -54,28 +51,6 @@ def _init_sentry(dsn_secret_name: str) -> None:
 
 _init_sentry("hermes/sentry-dsn-cron")
 
-RUNTIME_ARN = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
-QUALIFIER = os.environ.get("AGENTCORE_QUALIFIER", "")
-
-_agentcore_client: Any = None
-
-
-def _agentcore() -> Any:
-    global _agentcore_client
-    if _agentcore_client is None:
-        # Multi-step agent runs can exceed boto3's default 60s read timeout.
-        # Stay below the Lambda function timeout so we error cleanly instead
-        # of being killed by the runtime mid-call.
-        _agentcore_client = boto3.client(
-            "bedrock-agentcore",
-            config=Config(
-                read_timeout=590,
-                connect_timeout=10,
-                retries={"max_attempts": 0},
-            ),
-        )
-    return _agentcore_client
-
 
 def handler(event: dict, context: Any) -> dict:
     """EventBridge Scheduler handler.
@@ -84,123 +59,135 @@ def handler(event: dict, context: Any) -> dict:
     {
         "jobId": "daily_summary",
         "userId": "user_abc123",
+        "actorId": "discord:...",
+        "originChannel": "discord",
+        "originChatId": "...",
         "prompt": "Summarize today's AI news",
-        "delivery": {
-            "channel": "telegram",
-            "chatId": "123456789"
-        }
+        "delivery": {"channel": "telegram", "chatId": "123456789"}
     }
     """
     logger.info("Cron event: %s", json.dumps(event))
 
     job_id = event.get("jobId", f"cron_{int(time.time())}")
     user_id = event.get("userId", "")
+    actor_id = event.get("actorId", "") or f"cron:{job_id}"
+    origin_channel = event.get("originChannel", "") or "cron"
+    origin_chat_id = event.get("originChatId", "") or ""
     prompt = event.get("prompt", "")
-    delivery = event.get("delivery", {})
+    delivery = event.get("delivery") or {}
 
     if not user_id or not prompt:
         logger.error("Missing userId or prompt in cron event")
         return {"status": "error", "reason": "missing userId or prompt"}
 
-    # Build session ID.
-    session_id = f"{user_id}:cron:{job_id}"
-    if len(session_id) < 33:
-        session_id = session_id + ":" + "0" * (33 - len(session_id) - 1)
-
-    # Invoke AgentCore with cron action.
-    payload = {
-        "action": "cron",
-        "userId": user_id,
-        "actorId": f"cron:{job_id}",
-        "channel": "cron",
-        "message": prompt,
-        "jobId": job_id,
-        "config": {
-            "prompt": prompt,
-            "delivery": delivery,
-        },
-    }
-
-    try:
-        response = _agentcore().invoke_agent_runtime(
-            agentRuntimeArn=RUNTIME_ARN,
-            qualifier=QUALIFIER,
-            runtimeSessionId=session_id,
-            runtimeUserId=f"cron:{user_id}",
-            payload=json.dumps(payload),
-            contentType="application/json",
-            accept="application/json",
+    # Skip duplicate firings of the same schedule. CRONFIRE#…/CLAIM is
+    # written conditionally — if the previous firing's claim is still
+    # present (and not TTL-expired), put_item raises and we drop this
+    # firing. The router lambda's followup deletes the claim when the
+    # agent run completes, so quick agent runs free the slot fast.
+    claim_key = f"CRONFIRE#{user_id}#{job_id}"
+    if not _try_claim_cron_fire(claim_key):
+        logger.info(
+            "Skipping scheduling job %s/%s — another firing of the same "
+            "schedule is already enqueued/in-flight.", user_id, job_id,
         )
-        result = json.loads(response["payload"].read())
-        agent_response = result.get("response", "")
-    except Exception as exc:
-        logger.exception("AgentCore cron invocation failed")
-        agent_response = f"Cron job {job_id} failed: {exc}"
+        return {"status": "skipped", "reason": "already_enqueued"}
 
-    # Deliver result to the configured channel.
-    if delivery and agent_response:
-        _deliver(delivery, agent_response, job_id)
-
-    return {
-        "status": "ok",
-        "jobId": job_id,
-        "responseLength": len(agent_response),
+    # Hand off to the router lambda's _dispatch_request path. The router
+    # uses the same lock + queue as the user's normal Discord/Telegram
+    # interactions, so a cron firing serialises with live messages from
+    # the same user (and the user gets a "⏳ queued" reply if they
+    # message during a cron run).
+    dispatch_payload = {
+        "_dispatch_request": {
+            "actor_id": actor_id,
+            "channel": origin_channel,
+            "agent_payload": {
+                "action": "chat",
+                "userId": user_id,
+                "actorId": actor_id,
+                "channel": origin_channel,
+                "chatId": origin_chat_id,
+                "message": prompt,
+            },
+            "delivery": {
+                **delivery,
+                # Plumbed through to the followup so it can release the
+                # claim once the agent's run completes (TTL covers
+                # crashes; this is the happy-path early-release).
+                "cron_claim_key": claim_key,
+                # Header used when posting the result (channel-side).
+                "cron_job_id": job_id,
+            },
+        }
     }
 
-
-def _deliver(delivery: dict, text: str, job_id: str) -> None:
-    """Send the cron output to the specified channel."""
-    channel = delivery.get("channel", "")
-    chat_id = delivery.get("chatId", "")
-
-    if channel == "telegram" and chat_id:
-        _send_telegram(chat_id, f"[Cron: {job_id}]\n\n{text}")
-    elif channel == "slack" and chat_id:
-        _send_slack(chat_id, f"*Cron: {job_id}*\n\n{text}")
-    else:
-        logger.info("No delivery channel configured — response logged only")
-
-
-def _send_telegram(chat_id: str, text: str) -> None:
-    token = _get_secret("telegram-bot-token")
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    # Truncate to Telegram's limit.
-    if len(text) > 4096:
-        text = text[:4090] + "\n…"
-    data = json.dumps({"chat_id": chat_id, "text": text}).encode()
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"},
-    )
+    router_fn = os.environ["ROUTER_FUNCTION_NAME"]
     try:
-        urllib.request.urlopen(req, timeout=15)
-    except Exception as exc:
-        logger.error("Telegram delivery failed: %s", exc)
+        boto3.client("lambda").invoke(
+            FunctionName=router_fn,
+            InvocationType="Event",
+            Payload=json.dumps(dispatch_payload).encode(),
+        )
+    except Exception:
+        logger.exception(
+            "Failed to dispatch cron job %s/%s to router; releasing claim",
+            user_id, job_id,
+        )
+        _release_cron_claim(claim_key)
+        return {"status": "error", "reason": "dispatch_failed"}
+
+    return {"status": "dispatched", "jobId": job_id}
 
 
-def _send_slack(channel: str, text: str) -> None:
-    token = _get_secret("slack-bot-token")
-    url = "https://slack.com/api/chat.postMessage"
-    data = json.dumps({"channel": channel, "text": text}).encode()
-    req = urllib.request.Request(url, data=data, headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
-    })
+# ---- Claim records (deduplicate same-jobId firings) ---------------------
+
+_CLAIM_TTL_SECONDS = 900  # 15 min — matches router's lock TTL.
+
+
+def _identity_table():
+    table_name = os.environ.get("IDENTITY_TABLE", "")
+    if not table_name:
+        return None
+    return boto3.resource("dynamodb").Table(table_name)
+
+
+def _try_claim_cron_fire(claim_key: str) -> bool:
+    """Conditional put on CRONFIRE#…/CLAIM. Returns True if we acquired
+    the claim, False if the previous firing's claim is still present
+    (and not yet TTL-expired)."""
+    table = _identity_table()
+    if table is None:
+        # No identity table configured — skip dedup, always proceed.
+        return True
+    now = int(time.time())
     try:
-        urllib.request.urlopen(req, timeout=15)
+        table.put_item(
+            Item={
+                "PK": claim_key,
+                "SK": "CLAIM",
+                "claimedAt": now,
+                "ttl": now + _CLAIM_TTL_SECONDS,
+            },
+            ConditionExpression="attribute_not_exists(PK) OR #ttl < :now",
+            ExpressionAttributeNames={"#ttl": "ttl"},
+            ExpressionAttributeValues={":now": now},
+        )
+        return True
     except Exception as exc:
-        logger.error("Slack delivery failed: %s", exc)
+        # ConditionalCheckFailedException → already claimed; anything else
+        # we treat as "skip this firing, don't risk duplicate dispatch".
+        if exc.__class__.__name__ != "ConditionalCheckFailedException":
+            logger.warning("Cron claim acquire error for %s: %s", claim_key, exc)
+        return False
 
 
-# ---- Secrets cache -------------------------------------------------------
-
-_secrets_cache: dict[str, str] = {}
-
-
-def _get_secret(name: str) -> str:
-    if name in _secrets_cache:
-        return _secrets_cache[name]
-    sm = boto3.client("secretsmanager")
-    resp = sm.get_secret_value(SecretId=f"hermes/{name}")
-    value = resp["SecretString"]
-    _secrets_cache[name] = value
-    return value
+def _release_cron_claim(claim_key: str) -> None:
+    """Best-effort release. Idempotent."""
+    table = _identity_table()
+    if table is None:
+        return
+    try:
+        table.delete_item(Key={"PK": claim_key, "SK": "CLAIM"})
+    except Exception:
+        logger.warning("Cron claim release failed for %s", claim_key, exc_info=True)
